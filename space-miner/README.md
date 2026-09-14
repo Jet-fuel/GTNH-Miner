@@ -38,7 +38,7 @@ Each module has its own ME Interface adapter + transposer; one shared OC Databas
 | `loader.lua` | broker | One module's consumable-load sequence, run as a scheduler task. Confirms database fingerprints by read-back and routes items into the input bus by identity (not slot position). |
 | `logger.lua` | broker | Logging with a configurable backend (file / console / Loki). Disabled by default — ERROR/WARN still written to `/tmp/spacemining.log`. Configured from the editor's settings page. |
 | `dust_telem.lua` | dust node **(required)** | Queries the dust-storage ME subnet on the interval the broker sets; broadcasts tracked item stocks back. What to scan is pushed by the broker, so this node holds no policy of its own. Broker won't dispatch without it. |
-| `hw_telem.lua` | hw node **(required)** | Scans the hardware-staging ME network every 10 s for drone counts and drill kit pairs. Broker won't dispatch without it. |
+| `hw_telem.lua` | hw node **(required)** | Scans the hardware-staging ME network every 10 s for drill kit pairs, and auto-crafts them to par. Does **not** scan drones — those are a declared setting on the broker. Broker won't dispatch without it. |
 | `fluid_telem.lua` | fluid node **(required)** | Queries the plasma ME fluid network on the interval the broker sets; broadcasts plasma volumes. Modules need plasma to run, so the broker won't dispatch without it. |
 | `job_node.lua` | remote worker *(optional)* | Legacy remote worker for additional modules on a separate computer. Retained for future multi-node fleets; not required for the single-broker setup. |
 

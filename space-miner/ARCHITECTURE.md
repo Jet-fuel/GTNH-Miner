@@ -171,7 +171,9 @@ rather than guessing from a local copy that may have drifted.
 
 ### Hardware Telemetry Node (hw_telem.lua)
 
-**Purpose:** Scans the drone and drill consumable inventory from the hardware-staging ME network, broadcasts availability to broker.
+**Purpose:** Scans the drill consumable inventory from the hardware-staging ME network, broadcasts availability to broker, and auto-crafts tips and rods back up to par.
+
+Drones are **not** scanned. They are a durable asset — you own them, they move between the network and a bus, nothing consumes them — so the broker holds the count as a declared setting (`droneStock.*`) and keeps its own ledger. Only consumed items are measured here.
 
 **Hardware:**
 - Tier 2 Wireless Network Card
@@ -180,22 +182,35 @@ rather than guessing from a local copy that may have drifted.
 
 **Network:**
 - **Outbound (Port 2026):** Broadcasts HW_UPDATE payload every 10 seconds
-- Payload: drone counts (by tier key), drill kit counts (tips ∩ rods by material), and any outstanding restock orders
+- Payload: drill kit counts (tips ∩ rods by material) and any outstanding restock orders. No `drones` section — the broker guards on its presence and leaves its declared ledger alone without it.
 - **Inbound (Port 2025):** Receives DRILL_PAR from the broker — the par levels this node crafts back up to
 
-Note the 10s cadence is nominal. The loop's `event.pull(10, ...)` returns early on
-any modem traffic on an open port, and the other telem nodes broadcast on 2026
-continuously, so iterations are frequent and irregular. Anything in this node that
-needs to be rate-limited uses `computer.uptime()`, never a loop counter.
+Note the 10s cadence is nominal for the LOOP: `event.pull` returns early on any
+traffic on an open port, plus key presses, so iterations are irregular. Anything
+rate-limited here uses `computer.uptime()`, never a loop counter — and that now
+includes the scan itself, which is gated on the wall clock. It used to run on
+every early wake, which meant a single `DRILL_PAR` push bought a whole extra
+network read.
 
 **Inventory Scanning:**
-- Calls `me_controller.getItemsInNetwork()` for all items
-- Counts items with exact label match (e.g. "Mining Drone Mk-VII (ZPM)", "Steel
-  Drill Tip"). The drone label differs by pack in two ways — `MK-` on GTNH 2.8
-  and 2.9-pre-b3, `Mk-` from 2.9 beta 3, and no ` (VOLT)` suffix at all on 2.8 —
-  and the broker sends both facts with `DRILL_PAR`, since this node holds no
-  config. The full-scan fallback keys on the roman tier alone, which no version
-  has moved, so it works before the broker is heard from. See `gtVersion`.
+- **Two queries per cycle, not thirty-two.** An OC filter matches any field of a
+  stack, including `name`, the internal item id — and the eighteen tip and rod
+  labels sit on two ids. So the node asks by id and sorts the answer out in Lua.
+  This matters because a filtered query costs the server exactly what an
+  unfiltered one costs: OC converts the whole network before applying the filter,
+  so the only thing that reduces cost is asking fewer times. See "What an ME
+  scan actually costs the server" in SETTINGS.md.
+- The ids are **learned, not written down** — the first scan after boot is a
+  per-label pass that reads each label's id off its own result. A group that
+  returns too many entries, or leaves the heap too tight, is abandoned and its
+  labels revert to per-label queries permanently.
+- A whole-network `getItemsInNetwork()` is the fallback for a device that
+  ignores the filter. It is **not** used otherwise: on a Pattern-Repeater-merged
+  network the resulting list does not fit in the node's heap, and that failure
+  can stop the machine rather than raising a catchable error.
+- The pack-version drone label problem no longer applies to this node, since it
+  asks about no drones. It still applies to the broker and the loader, which
+  resolve drones by label. See `gtVersion`.
 - Groups tips and rods by material to compute kits
 - Drill kit = min(tips, rods) for that material
 - Only reports non-zero counts to minimize payload

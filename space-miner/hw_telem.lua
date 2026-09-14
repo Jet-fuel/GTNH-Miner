@@ -1,10 +1,16 @@
 -- =============================================================================
 -- Node ID: MEDINA-HWRelay
 -- File:    hw_telem.lua
--- Purpose: Scans Space Elevator staging ME network for drone and drill
---          consumable availability; broadcasts stock data to the broker, and
---          auto-crafts drill tips/rods back up to the par levels the broker
---          publishes (DRILL_PAR on port 2025).
+-- Purpose: Scans Space Elevator staging ME network for drill consumable
+--          availability; broadcasts stock data to the broker, and auto-crafts
+--          drill tips/rods back up to the par levels the broker publishes
+--          (DRILL_PAR on port 2025).
+--
+--          Drones are NOT scanned. They are a durable asset -- you own them,
+--          they move between the network and a bus, nothing consumes them --
+--          so the broker holds the count as a declared setting and keeps the
+--          ledger itself (settings.lua, droneStock.*). Tips and rods are
+--          consumed, so they are the only thing here that has to be measured.
 --
 --          The broker owns the par policy; this node owns execution, because it
 --          holds the ME controller proxy and the freshest counts. See
@@ -40,54 +46,6 @@ if not me then error("Missing ME Controller (needed to read network inventory)."
 local gpu      = component.gpu
 local nodeName = "MEDINA-HWRelay"
 
--- Hardcoded drone and drill lists (don't load config to save memory)
-local droneKeys = {"max","uxv","umv","uiv","uev","uhv","uv","zpm","luv","iv","ev","hv","mv","lv"}
-
--- The roman tier of each drone, without the marker or the voltage.
---
--- GTNH has renamed this label twice, and the label is how this node counts
--- drones, so getting it wrong reports 0 of every tier and the broker never
--- dispatches:
---
---     2.8          Mining Drone MK-IX
---     2.9-pre-b3   Mining Drone MK-IX (UHV)
---     2.9  (b3+)   Mining Drone Mk-IX (UHV)
---
--- This node cannot work out which form to use: it holds an ME controller and
--- nothing else, loads no config.lua by design, and an item name has nothing to
--- probe. So the broker sends both facts with DRILL_PAR, the same way it sends
--- drillCraftSlots, and droneNames is rebuilt when they arrive.
-local droneRoman = {
-  max="XIV", uxv="XIII", umv="XII",
-  uiv="XI",  uev="X",    uhv="IX",
-  uv="VIII", zpm="VII",  luv="VI",
-  iv="V",    ev="IV",    hv="III",
-  mv="II",   lv="I"
-}
-
--- Map drone keys to their voltage tiers. The other half of a label, and the
--- tier column on the dashboard.
-local droneVoltages = {
-  max="MAX", uxv="UXV", umv="UMV", uiv="UIV", uev="UEV", uhv="UHV",
-  uv="UV", zpm="ZPM", luv="LuV", iv="IV", ev="EV", hv="HV",
-  mv="MV", lv="LV"
-}
-
--- Reverse of droneRoman, for the full-scan fallback: "IX" -> "uhv".
---
--- Keyed on the ROMAN ALONE, which is the one part of the label no version has
--- moved. It used to be keyed on "IX (UHV)", so the fallback matched 2.9 and
--- nothing else -- meaning it did not in fact rescue a node the broker had not
--- reached, which is the entire reason the fallback is marker-insensitive.
-local droneKeyByRoman = {}
-for key, roman in pairs(droneRoman) do droneKeyByRoman[roman] = key end
-
--- Defaults to the 2.9 spelling rather than an older one, so a fresh install on
--- the current pack is right from the first scan even if the broker never comes
--- up. A 2.8 fleet reads zero for one cycle and corrects on the first DRILL_PAR.
-local droneMark   = "Mk"
-local droneSuffix = true
-local droneNames  = {}
 
 modem.setStrength(400)
 -- Only 2025 is opened. modem.open() is what makes a port RECEIVE; broadcasting
@@ -454,14 +412,9 @@ local function drawStaticFrame()
   print(" MEDINA RELAY NETWORK  |  NODE: " .. nodeName)
   print("================================================================================")
   gpu.setForeground(0xFFFFFF)
-  term.setCursor(2, 5)  io.write("DRONE FLEET STATUS")
-  term.setCursor(40, 5) io.write("DRILL KIT AVAILABILITY")
+  term.setCursor(2, 5)  io.write("DRILL KIT AVAILABILITY")
+  term.setCursor(40, 5) io.write("RESTOCK (auto-craft to par)")
   term.setCursor(2, 6)  io.write(string.rep("-", 76))
-
-  -- Right column only (x=40+). The drone list occupies rows 7-20 on the left,
-  -- so anything full-width here gets erased by it.
-  gpu.setForeground(0xFFFFFF)
-  term.setCursor(40, 16) io.write("RESTOCK (auto-craft to par)")
 
   gpu.setForeground(0x555555)
   term.setCursor(2, 22) io.write(string.rep("=", 76))
@@ -524,53 +477,77 @@ local gc = type(collectgarbage) == "function" and collectgarbage or function() e
 -- learn it does not fit, the node is gone. Nor can a free-memory check predict
 -- it; there was headroom by that measure immediately before the pass that died.
 --
--- So the per-label path stays the default, as it was, and the full pass stays
--- what it always was: the fallback for a device that ignores the filter. What
--- has changed is the two things that were costing us for nothing:
+-- So the full pass is off the table, and what replaces it is asking FEWER
+-- TIMES rather than asking differently. Two changes do that.
 --
---   1. The queries are spaced across the interval instead of fired back to
---      back. This does not reduce the total by one millisecond -- it is the
---      same thirty-two conversions -- but it lands them as isolated ticks
---      rather than one unbroken burst, which is what MSPT was oscillating
---      against. The oscillation is the part that was actually hurting.
+-- The first is that drones left this file entirely. They are a durable asset --
+-- you own them, they move between the network and a bus, nothing consumes them
+-- -- so the broker holds the count as a declared setting and keeps its own
+-- ledger. Fourteen of the thirty-two labels were drones, and measuring a number
+-- somebody already knows is the cheapest kind of work to delete.
+--
+-- The second is grouping the eighteen that are left.
+--
+-- An OC filter matches any field of a stack, not just `label` -- including
+-- `name`, the internal item id. The eighteen tip and rod labels do not have
+-- eighteen ids: measured on this network with hw_scan_probe.lua, they sit on
+-- two, and querying by id returns every stack sharing it --
+--
+--   gregtech:gt.metaitem.01   9 of our labels, 1391 entries come back
+--   gregtech:gt.metaitem.02   8 of our labels,  307 entries come back
+--
+-- -- against 5873 entries for the whole network. So two queries do the work of
+-- eighteen, at a fraction of the memory the full pass needed, and since cost
+-- tracks the NUMBER of calls that is the entire saving.
+--
+-- The ids are learned rather than written down. Nothing in this fleet records
+-- them, a pack update could move them, and the answer is already sitting in the
+-- result of a per-label query. So the first scan after boot is the old
+-- per-label pass, every label's id is read off its own result, and every scan
+-- after that is grouped. A label the network does not currently hold has no id
+-- to learn, so it stays per-label until it appears -- which costs one query and
+-- fixes itself.
+--
+-- A group is only worth having while it stays small. The id is shared with
+-- every other item of its type, so on another network gt.metaitem.01 could be
+-- most of the ME system, and this node's whole problem is memory. A group that
+-- comes back larger than GROUP_MAX_ENTRIES, or that leaves the heap under
+-- GROUP_MIN_FREE, is abandoned and its labels go back to being asked for one at
+-- a time. That decision is measured on the real answer, not guessed.
+--
+-- Two further things that were costing us for nothing:
+--
+--   1. The queries are spaced across the interval rather than fired back to
+--      back. With two of them this matters far less than it did with
+--      thirty-two, but it costs nothing and it still holds when a group is
+--      abandoned and the count goes back up.
 --   2. The scan is gated on the wall clock (see the main loop), so an early
---      wake no longer buys a whole extra scan.
+--      wake no longer buys a whole extra scan. That one was worth more than it
+--      looks: the loop wakes on any traffic, and every wake used to rescan.
 --
--- Reducing the total is still open, and both remaining levers cost something
--- other than code: scan a rotating subset of the labels per cycle and accept
--- staler counts, or put this node on its own small ME subnet through an
--- Interface, the way the dust node is -- that node runs the identical query
--- against a small network and cost 0.14s across the same capture. Nothing
--- inside this file can make thirty-two whole-network conversions cheap.
+-- Where that leaves us: thirty-two whole-network conversions every ten seconds
+-- have become two. The one lever left is the size of the network behind the
+-- handle -- the dust node runs the identical query against a small subnet and
+-- cost 0.14s across the same capture that caught this node at 61.16s -- and it
+-- is not available here. This node has to be able to REQUEST crafts from the
+-- main network, so it needs to see all of it; a filtered view would buy cheap
+-- scans and lose the auto-crafting that is half of what this node is for.
 -- =============================================================================
 
 -- Every label worth asking about, and where its count belongs in `assets`.
--- Built from the tables above so there is still exactly one list of names.
+-- Built from drillLookup so there is still exactly one list of names.
 --
--- assets.drones is keyed by drone KEY ("uhv"), not by label. It used to be keyed
--- by the full label, which meant the marker rename reached the dashboard and the
--- payload as well as the query -- three places to get right instead of one. The
--- label is now purely the thing we ask the network, and rebuilding it on a
--- droneMark change touches nothing else.
-local scanTargets = {}
-
-local function rebuildDroneLabels()
-  for _, key in ipairs(droneKeys) do
-    local base = "Mining Drone " .. droneMark .. "-" .. droneRoman[key]
-    droneNames[key] = droneSuffix and (base .. " (" .. droneVoltages[key] .. ")") or base
-  end
-  scanTargets = {}
-  for _, key in ipairs(droneKeys) do
-    scanTargets[#scanTargets + 1] =
-      { label = droneNames[key], bucket = "drones", key = key }
-  end
-  for _, label in ipairs(drillLabels) do
-    local bucket = string.find(label, "Drill Tip", 1, true) and "drillTips" or "drillRods"
-    scanTargets[#scanTargets + 1] = { label = label, bucket = bucket, key = drillLookup[label] }
-  end
+-- Static now that drones are gone. It used to be rebuilt whenever the broker
+-- told us which drone spelling this pack uses; nothing here depends on a pack
+-- version any more, because a drill tip has been called a drill tip throughout.
+local scanTargets  = {}
+local targetByLabel = {}
+for _, label in ipairs(drillLabels) do
+  local bucket = string.find(label, "Drill Tip", 1, true) and "drillTips" or "drillRods"
+  local t = { label = label, bucket = bucket, key = drillLookup[label] }
+  scanTargets[#scanTargets + 1] = t
+  targetByLabel[label] = t
 end
-
-rebuildDroneLabels()
 
 -- Seconds between scans. Was a bare literal in the event.pull at the bottom of
 -- this file, which left the one cadence here with nothing naming it.
@@ -580,11 +557,27 @@ local SCAN_INTERVAL = 10
 -- that comes back bigger than this was not filtered at all.
 local FILTER_SANE_MAX = 64
 
+-- Entries a grouped query may return before the group is judged not worth it.
+-- The measured worst case here was 1391; this leaves room for the network to
+-- grow without leaving room for a group that is effectively the full pass
+-- wearing a filter.
+local GROUP_MAX_ENTRIES = 2000
+
+-- Heap fraction that must survive a grouped query for the group to be used
+-- again. Entries are the memory cost and entry size is not knowable in advance,
+-- so the count above is a guard and this is the measurement.
+local GROUP_MIN_FREE = 0.25
+
 -- Total network count for one exact label, or nil if the query failed.
+-- Returns the network total, and the internal item id the label turned out to
+-- live on. That second value is what makes the grouped queries below possible:
+-- it cannot be hardcoded (nothing in this fleet records it, and a pack update
+-- could move it) so it is read off the answer to a question we were asking
+-- anyway.
 local function countLabel(label)
   local ok, items = pcall(me.getItemsInNetwork, { label = label })
   if not ok or type(items) ~= "table" then return nil end
-  local total = 0
+  local total, name = 0, nil
   for i = 1, #items do
     local it = items[i]
     -- Re-check the label rather than trusting the filter. It is compared field
@@ -592,9 +585,10 @@ local function countLabel(label)
     -- fold unrelated items into this count; an exact test costs one comparison.
     if type(it) == "table" and it.label == label then
       total = total + (it.size or 0)
+      name  = name or it.name
     end
   end
-  return total
+  return total, name
 end
 
 -- Is the filter actually honoured here? Decided once, at startup, because the
@@ -621,7 +615,7 @@ end
 local scanState = { ok = true, mode = useFilter and "filtered" or "full", err = nil }
 
 local function newAssets()
-  return { drones = {}, drillTips = {}, drillRods = {} }
+  return { drillTips = {}, drillRods = {} }
 end
 
 -- One small query per target, spaced out. Returns nil if any of them failed: a
@@ -644,23 +638,120 @@ end
 -- the scan is done.
 local deferredEvent = nil
 
+-- What we have learned about where our labels live.
+--   labelName : label -> internal id
+--   groupIds  : the ids we know about, in discovery order
+--   groupBad  : ids abandoned for being too large to be worth a grouped query
+local labelName = {}
+local groupIds  = {}
+local groupBad  = {}
+
+local function learnName(label, id)
+  if not id or labelName[label] then return end
+  labelName[label] = id
+  for _, known in ipairs(groupIds) do
+    if known == id then return end
+  end
+  groupIds[#groupIds + 1] = id
+end
+
+-- Every tracked label sharing one internal id, in a single query. Returns a
+-- label -> count table, or nil if the query failed or the group turned out to
+-- be too big to keep using.
+local function countGroup(id)
+  local ok, items = pcall(me.getItemsInNetwork, { name = id })
+  if not ok or type(items) ~= "table" then return nil end
+
+  local n = #items
+  if n > GROUP_MAX_ENTRIES then
+    items = nil
+    gc()
+    groupBad[id] = true
+    return nil
+  end
+
+  local counts = {}
+  for i = 1, n do
+    local it = items[i]
+    -- Only our labels. The id is shared with everything of its type, so the
+    -- result is mostly things we do not track, and the label test is what
+    -- separates them -- the same reason countLabel re-checks its own filter.
+    if type(it) == "table" and it.label and targetByLabel[it.label] then
+      counts[it.label] = (counts[it.label] or 0) + (it.size or 0)
+    end
+  end
+
+  items = nil
+  gc()
+  -- Judge the group on what it actually cost, not only on how many entries it
+  -- was. A count that is fine on one machine can still be most of the heap.
+  if computer.freeMemory() < computer.totalMemory() * GROUP_MIN_FREE then
+    groupBad[id] = true
+  end
+  return counts
+end
+
 local function scanFiltered()
   local assets = newAssets()
+
+  -- Plan the cycle first, so the pacing below knows how many calls it is
+  -- spreading. One call per usable group, plus one for every label that cannot
+  -- be placed in a group yet -- which on the first scan after boot is all of
+  -- them, and is how the ids get learned in the first place.
+  local groupCalls, labelCalls = {}, {}
+  for _, id in ipairs(groupIds) do
+    if not groupBad[id] then groupCalls[#groupCalls + 1] = id end
+  end
+  for _, t in ipairs(scanTargets) do
+    local id = labelName[t.label]
+    if not id or groupBad[id] then labelCalls[#labelCalls + 1] = t end
+  end
+
+  local calls = #groupCalls + #labelCalls
   -- Floor of one tick: a synchronized call cannot go faster than that anyway.
-  local spacing = math.max(0.05, (SCAN_INTERVAL * 0.6) / math.max(1, #scanTargets))
-  for i, t in ipairs(scanTargets) do
-    if i > 1 then
+  local spacing = math.max(0.05, (SCAN_INTERVAL * 0.6) / math.max(1, calls))
+  local made = 0
+  local function pace()
+    made = made + 1
+    if made > 1 then
       local ev = { event.pull(spacing) }
       if ev[1] and not deferredEvent then deferredEvent = ev end
     end
-    local n = countLabel(t.label)
-    if not n then
-      scanState = { ok = false, mode = "filtered", err = "query failed: " .. t.label }
+  end
+
+  for _, id in ipairs(groupCalls) do
+    pace()
+    local counts = countGroup(id)
+    if not counts then
+      -- Either the query failed or the group was just abandoned. Both end the
+      -- cycle rather than returning what we have: the labels behind this id
+      -- would read as zero stock, and ordering against that fires a craft for
+      -- every material at once. An abandoned group is picked up label by label
+      -- on the next scan.
+      scanState = { ok = false, mode = "grouped",
+                    err = groupBad[id] and ("group too large: " .. id)
+                                        or ("group query failed: " .. id) }
       return nil
     end
+    for label, n in pairs(counts) do
+      local t = targetByLabel[label]
+      if t and n > 0 then assets[t.bucket][t.key] = (assets[t.bucket][t.key] or 0) + n end
+    end
+  end
+
+  for _, t in ipairs(labelCalls) do
+    pace()
+    local n, id = countLabel(t.label)
+    if not n then
+      scanState = { ok = false, mode = "per-label", err = "query failed: " .. t.label }
+      return nil
+    end
+    learnName(t.label, id)
     if n > 0 then assets[t.bucket][t.key] = (assets[t.bucket][t.key] or 0) + n end
   end
-  scanState = { ok = true, mode = "filtered", err = nil }
+
+  scanState = { ok = true, err = nil,
+                mode = string.format("%dq", calls) }
   return assets
 end
 
@@ -687,28 +778,12 @@ local function scanFull()
   end
 
   for _, item in ipairs(itemList) do
-    if item.label then
-      if string.find(item.label, "Mining Drone", 1, true) then
-        -- Form-insensitive on purpose, and only here. The filtered path has to
-        -- name an exact label because the match happens on the Java side, but
-        -- this path is already holding the network's own string -- so it can
-        -- read the roman out of any spelling and cost nothing, which keeps the
-        -- full-scan fallback working on a node the broker has not reached yet.
-        --
-        -- The capture stops at the roman and ignores whatever follows, so a
-        -- bare "Mining Drone MK-IX" and a suffixed "Mining Drone Mk-IX (UHV)"
-        -- both land on "IX". [XVI]+ is greedy, so "XIII" captures whole rather
-        -- than colliding with "X".
-        local roman = item.label:match("^Mining Drone [Mm][Kk]%-([XVI]+)")
-        local key   = roman and droneKeyByRoman[roman]
-        if key then assets.drones[key] = (assets.drones[key] or 0) + item.size end
-      elseif drillLookup[item.label] then
-        local key = drillLookup[item.label]
-        if string.find(item.label, "Drill Tip", 1, true) then
-          assets.drillTips[key] = (assets.drillTips[key] or 0) + item.size
-        elseif string.find(item.label, "Rod", 1, true) then
-          assets.drillRods[key] = (assets.drillRods[key] or 0) + item.size
-        end
+    if item.label and drillLookup[item.label] then
+      local key = drillLookup[item.label]
+      if string.find(item.label, "Drill Tip", 1, true) then
+        assets.drillTips[key] = (assets.drillTips[key] or 0) + item.size
+      elseif string.find(item.label, "Rod", 1, true) then
+        assets.drillRods[key] = (assets.drillRods[key] or 0) + item.size
       end
     end
   end
@@ -729,50 +804,33 @@ local function scanAssets()
 end
 
 local function updateDashboard(assets)
-  -- Drone column (left, rows 7-20)
-  local totalDrones = 0
-  for i, key in ipairs(droneKeys) do
-    local count = assets.drones[key] or 0
-    totalDrones = totalDrones + count
-    local row = 6 + i
-    term.setCursor(2, row)
-    gpu.fill(2, row, 36, 1, " ")
-    gpu.setForeground(count > 0 and 0x00FFFF or 0x555555)
-    -- Display drone model with voltage tier. Built from droneRoman rather than
-    -- picked back out of the label: the tier is its own column, and the label is
-    -- for asking the network with, not for reading identity out of. That split
-    -- is what keeps the voltage on screen for a 2.8 fleet, whose labels do not
-    -- carry one.
-    local voltage = droneVoltages[key]
-    local model   = droneMark .. "-" .. (droneRoman[key] or "?")
-    io.write(string.format("  %-14s [%s]: %d", model, voltage, count))
-  end
-
-  -- Drill column (right, rows 7-15)
+  -- Drill column, now on the LEFT (rows 7-15). It used to sit at x=40 because
+  -- the drone list owned the left half; with drones gone this is the only stock
+  -- this node measures, so it takes the main column and the restock queue gets
+  -- the whole of the right.
+  --
+  -- The old "[ NO FLEET -- MASKED ]" state went with it. It hid kit counts when
+  -- the network held no drones, on the reasoning that kits are useless without
+  -- something to put them in -- but this node no longer knows whether a fleet
+  -- exists, the broker does, and hiding a measurement because of a fact we can
+  -- no longer see would be guessing.
   for i, key in ipairs(drillKeyOrder) do
     local tips = assets.drillTips[key] or 0
     local rods = assets.drillRods[key] or 0
     local kits = math.min(tips, rods)
     local displayName = drillDisplayNames[key]
     local row = 6 + i
-    term.setCursor(40, row)
-    gpu.fill(40, row, 38, 1, " ")
-    if totalDrones > 0 then
-      gpu.setForeground(kits > 0 and 0xFF00FF or 0x555555)
-      -- Display kits with individual tip and rod counts
-      io.write(string.format("  %-15s: %d (%d|%d)", displayName, kits, tips, rods))
-    else
-      gpu.setForeground(0x333333)
-      io.write("  [ NO FLEET — MASKED ]")
-    end
+    term.setCursor(2, row)
+    gpu.fill(2, row, 36, 1, " ")
+    gpu.setForeground(kits > 0 and 0xFF00FF or 0x555555)
+    -- Display kits with individual tip and rod counts
+    io.write(string.format("  %-15s: %d (%d|%d)", displayName, kits, tips, rods))
   end
 
   -- Restock queue: right column (x=40, width 38), rows 17-21.
   --
-  -- This has to live under the DRILL column, not across the screen. The drone
-  -- loop above owns rows 7-20 on the left and clears x=2..37 on every one of
-  -- them, so a full-width block here is partly erased on each repaint. The
-  -- drill column stops at row 15, which is what leaves 16-21 free on the right.
+  -- Right half only (x=40+). The drill loop above clears x=2..37 on rows 7-15
+  -- every repaint, so a full-width block here would be partly erased.
   local QX, QW = 40, 38
 
   -- Failures first: they are the entries a human has to act on, so if there are
@@ -800,7 +858,10 @@ local function updateDashboard(assets)
   end)
   local pending = view
 
-  local qRow, QLAST = 17, 21
+  -- Rows 7-21 on the right, where it used to be 17-21 under the drill column.
+  -- Fifteen rows instead of five, so the "...and N more" line is a good deal
+  -- harder to reach.
+  local qRow, QLAST = 7, 21
   local WORD = { nopattern = "NO PATTERN", failed = "REJECTED", queued = "queued" }
   for i, e in ipairs(pending) do
     if qRow > QLAST then break end
@@ -845,9 +906,9 @@ local function updateDashboard(assets)
   end
   for r = qRow, QLAST do gpu.fill(QX, r, QW, 1, " ") end
 
-  -- Scan health, bottom of the LEFT column. Row 21 is the one line there the
-  -- drone list (rows 7-20) does not repaint over, and the restock block owns
-  -- the right half of it. Free memory is on show because this node's failure
+  -- Scan health, bottom of the LEFT column. The drill list stops at row 15, so
+  -- row 21 is clear on the left, and the restock block owns the right half of
+  -- it. Free memory is on show because this node's failure
   -- mode is running out of it -- a repeated network can grow the item list
   -- without anything else on screen changing.
   gpu.fill(2, 21, 36, 1, " ")
@@ -868,7 +929,7 @@ end
 
 drawStaticFrame()
 
-local lastAssets = { drones={}, drillTips={}, drillRods={} }
+local lastAssets = { drillTips={}, drillRods={} }
 
 -- Helper to build payload from assets
 -- EVERY KEY, INCLUDING THE ZEROES.
@@ -884,10 +945,13 @@ local lastAssets = { drones={}, drillTips={}, drillRods={} }
 -- (stocks[name] or 0 over the whole watchlist) and fluid_telem (PLASMA_ORDER
 -- seeded to 0) have always sent theirs; this node was the odd one out.
 local function buildPayload(assets)
-  local payload = { drones={}, drills={} }
-  for _, key in ipairs(droneKeys) do
-    payload.drones[key] = assets.drones[key] or 0
-  end
+  -- No `drones` key at all. The broker guards on type(data.drones) == "table"
+  -- before reading it, so an absent one leaves its declared ledger alone --
+  -- which is the point: that ledger is now the source of truth and telemetry
+  -- has no business overwriting it. broker-mk3.lua reads brokerState.drones in
+  -- exactly one place, to offer a hint when NO drones are declared, and that
+  -- hint simply stops appearing.
+  local payload = { drills={} }
   for _, key in ipairs(drillKeyOrder) do
     local tips = assets.drillTips[key] or 0
     local rods = assets.drillRods[key] or 0
@@ -1029,23 +1093,11 @@ while true do
           -- answer: too few slots is slow, too many is rejected requests.
           slots = tonumber(msg.data.slots) or 1
           if slots < 1 then slots = 1 end
-          -- Which drone label form this pack uses: the marker's case, and
-          -- whether the voltage is in the name at all. Both absent from an
-          -- older broker, which leaves the 2.9 defaults standing rather than
-          -- blanking the labels. Rebuild only on a change: it reallocates
-          -- scanTargets, and this message arrives every 30 seconds.
-          --
-          -- The suffix is read as `~= false` so an older broker's nil means
-          -- "2.9 form", matching the default above. It is only honoured
-          -- alongside a valid marker, so a malformed packet cannot half-apply.
-          local mark = msg.data.droneMark
-          if mark == "MK" or mark == "Mk" then
-            local suffix = msg.data.droneSuffix ~= false
-            if mark ~= droneMark or suffix ~= droneSuffix then
-              droneMark, droneSuffix = mark, suffix
-              rebuildDroneLabels()
-            end
-          end
+          -- msg.data.droneMark / droneSuffix are ignored. The broker still
+          -- sends them, and they used to pick which spelling of the drone
+          -- label to ask the network for. Nothing here asks about drones any
+          -- more, so the whole pack-version question stops applying to this
+          -- node: a drill tip is called a drill tip on every version.
         end
       end
     end

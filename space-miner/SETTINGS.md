@@ -397,6 +397,21 @@ localisation lookup for its display name — before the filter is consulted, and
 `.toArray` then traverses that view twice. The filter only shrinks what crosses
 into Lua. It is a memory fix, not a speed one.
 
+So the only thing that reduces server cost is **asking fewer times**, and the
+hw node now does that two ways. Drones left the scan entirely — they are a
+durable asset, so the broker holds the count as a declared setting
+(`droneStock.*`) and keeps the ledger itself; only consumed items have to be
+measured. The eighteen drill labels that remain are asked for by internal item
+id rather than by label, because an OC filter matches any field of a stack and
+those eighteen labels sit on two ids. Thirty-two queries a cycle became two.
+
+The ids are learned at runtime, not written down: the first scan after boot is
+a per-label pass that reads each label's id off its own result. A group that
+comes back too large, or that leaves the heap too tight, is abandoned and its
+labels go back to being asked for one at a time — the id is shared with every
+other item of its type, and on a different network that could be most of the ME
+system.
+
 **So cost tracks the number of calls and the size of the network behind the
 handle.** The dust node makes one call per cycle against a small subnet through
 an ME Interface: 0.14 s across the whole capture. The hw node was making
@@ -407,7 +422,10 @@ cycle and keeps the per-label path only for a heap that cannot hold the list.
 
 The levers, in order of effect: how many calls per cycle, how large the network
 behind the handle is, and only then these intervals. Putting a monitoring node
-on its own small subnet is worth more than any interval you can set here.
+on its own small subnet is worth more than any interval you can set here — but
+only for a node that just reads. The hw node also has to **request crafts** from
+the main network, so it needs to see all of it; a filtered view would buy cheap
+scans and lose the auto-crafting that is half of what that node does.
 
 ### `wirelessStrength`
 

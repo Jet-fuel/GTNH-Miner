@@ -201,17 +201,21 @@ ck("2.9 needs no API gloss",
    (api.check(fake28(), "2.9")):match("parameter API") == nil, true)
 
 -- =============================================================================
-section("config.lua / hw_telem.lua -- drone labels follow the pack version")
+section("config.lua -- drone labels follow the pack version")
 -- =============================================================================
 -- config.lua cannot be dofile'd from here: it resolves settings.lua and
 -- module_api.lua relative to the working directory, which is the repo root when
 -- these tests run. So this reads its SOURCE, the same bargain the editor checks
 -- below make, and drives the shipped parts through the real builder.
 --
--- What this is actually guarding is the thing that let the bug ship: the drone
--- names are written down TWICE, in config.lua and again in hw_telem.lua, and
--- nothing made them agree ON EVERY VERSION. The old check compared the two only
--- under the 2.9 form, which is precisely why a 2.8-only difference got through.
+-- What this guarded originally was a duplication: the drone names were written
+-- down twice, in config.lua and again in hw_telem.lua, and nothing made them
+-- agree on every version. That second copy is gone -- hw_telem no longer scans
+-- for drones at all, because the broker holds the fleet as a declared setting
+-- and only consumed items have to be measured -- so the cross-check below it
+-- went with it. What is left still matters: the broker and the loader resolve
+-- drones BY LABEL, so config.lua building the wrong spelling is still a silent
+-- zero-in-stock.
 local cfgSrc = slurp("config.lua")
 
 -- key -> { roman, volt }, out of config.droneTiers.
@@ -257,59 +261,15 @@ ck("broker ships suffix",    brkSrc:find("droneSuffix = config.droneSuffix", 1, 
 -- tiers, and the editor prints them for asteroid rows. Only drones were renamed.
 ck("module tiers untouched",  cfgSrc:find('["MK-II"]', 1, true) ~= nil, true)
 
--- hw_telem holds the second copy. It cannot be loaded (it asserts a modem on
--- line 24), so check it builds its labels from the two facts rather than
--- hardcoding a spelling, and that its 14 tiers still spell out what config.lua
--- ships -- UNDER BOTH FORMS, which is the check that would have caught this.
-local hwSrc = slurp("hw_telem.lua")
-ck("node builds from parts",
-   hwSrc:find('droneMark .. "-" .. droneRoman[key]', 1, true) ~= nil, true)
-ck("node honours the suffix",
-   hwSrc:find("droneSuffix and (base", 1, true) ~= nil, true)
+-- hw_telem used to hold a second copy of these names and was checked against
+-- config.lua here, under all three label forms. It holds none now: it scans for
+-- drill tips and rods only, and those have never been renamed. The assertion
+-- that replaces the cross-check is simply that the copy is gone -- if a drone
+-- table ever reappears in that file, this duplication is back and so is the
+-- class of bug that came with it.
 local hwCode = code("hw_telem.lua")
-ck("node hardcodes no label",
-   hwCode:find('"Mining Drone MK%-') == nil and hwCode:find('"Mining Drone Mk%-') == nil, true)
--- The fallback keys on the roman alone. Keyed on "IX (UHV)" it matched 2.9 and
--- nothing else, so the marker-insensitive path did not in fact rescue anyone.
-ck("fallback keys on roman",
-   hwSrc:find("droneKeyByRoman", 1, true) ~= nil, true)
-ck("old model key is gone",
-   hwSrc:find("droneKeyByModel", 1, true) == nil, true)
-
-local romans, volts = {}, {}
-for key, roman in hwSrc:match("local droneRoman = {(.-)\n}"):gmatch('(%w+)="([^"]+)"') do
-  romans[key] = roman
-end
-for key, volt in hwSrc:match("local droneVoltages = {(.-)\n}"):gmatch('(%w+)="([^"]+)"') do
-  volts[key] = volt
-end
-local mismatched, nModels = 0, 0
-for key, roman in pairs(romans) do
-  nModels = nModels + 1
-  local t = shipped[key] or {}
-  for _, v in ipairs({ "2.9", "2.9-pre-b3", "2.8" }) do
-    if api.droneLabel(roman, volts[key] or "", v)
-       ~= api.droneLabel(t.roman or "", t.volt or "", v) then
-      mismatched = mismatched + 1
-    end
-  end
-end
-ck("node lists 14 tiers",     nModels, 14)
-ck("node agrees on all forms", mismatched, 0)
-
--- The full-scan fallback's pattern, run for real rather than grepped. Both
--- forms have to yield the same roman, or a node the broker has not reached
--- counts drones on 2.9 and nothing on 2.8.
-local function fallbackRoman(label)
-  return label:match("^Mining Drone [Mm][Kk]%-([XVI]+)")
-end
-ck("fallback reads 2.8",      fallbackRoman("Mining Drone MK-XIII"), "XIII")
-ck("fallback reads 2.9",      fallbackRoman("Mining Drone Mk-XIII (UXV)"), "XIII")
-ck("fallback reads pre-b3",   fallbackRoman("Mining Drone MK-IX (UHV)"), "IX")
--- Greedy, so the four-character roman does not truncate to the one-character
--- one and file every MAX drone under UEV.
-ck("fallback is greedy",      fallbackRoman("Mining Drone Mk-XIV (MAX)"), "XIV")
-ck("fallback spares others",  fallbackRoman("Mining Module MK-II"), nil)
+ck("node holds no drone table", hwCode:find("droneRoman", 1, true) == nil, true)
+ck("node asks for no drones",   hwCode:find("Mining Drone", 1, true) == nil, true)
 
 -- config.droneKeyByLabel is how the broker reads a drone back OUT of an input
 -- bus at boot -- a module mining when the broker went down still holds one, and
@@ -867,17 +827,22 @@ ck("missing drones section",  st.drones.luv, 1)
 applyHwStock(st, nil)
 ck("nil payload survives",    st.drones.luv, 1)
 
--- And the other half of the fix: the node has to actually send its zeroes, or
--- an un-upgraded broker keeps freezing. Source-checked, since hw_telem cannot
--- be loaded here.
+-- The other half of that fix was the node sending its zeroes rather than only
+-- non-zero counts. For drills it still has to, and that is checked below.
+--
+-- For drones it no longer applies: the node stopped scanning them entirely, so
+-- HW_UPDATE carries no `drones` section at all. That is why the "missing drones
+-- section" case above matters more than it used to -- it is now the normal
+-- payload, on every cycle, not a malformed one. The broker's declared ledger is
+-- the source of truth and telemetry leaves it alone.
 do
   local hw = slurp("hw_telem.lua")
   local body = hw:match("local function buildPayload%(assets%)(.-)\n  local crafting")
-  ck("payload body found",   body ~= nil, true)
-  ck("drones sent uncounted", body:find("if count > 0", 1, true), nil)
+  ck("payload body found",    body ~= nil, true)
   ck("kits sent uncounted",   body:find("if kits > 0", 1, true), nil)
-  ck("drones default to 0",
-     body:find("payload.drones[key] = assets.drones[key] or 0", 1, true) ~= nil, true)
+  ck("no drones in payload",  body:find("payload.drones", 1, true), nil)
+  ck("kits default to 0",
+     body:find("payload.drills[key] = { kits =", 1, true) ~= nil, true)
 end
 
 -- =============================================================================
