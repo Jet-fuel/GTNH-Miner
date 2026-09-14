@@ -479,18 +479,48 @@ local gc = type(collectgarbage) == "function" and collectgarbage or function() e
 -- =============================================================================
 -- NETWORK SCAN
 --
+-- Two ways to read the network, and the reason to prefer one is not the one
+-- this section used to give.
+--
 -- me.getItemsInNetwork() with no filter materialises EVERY stack in the network
 -- as its own Lua table, in one allocation. That was fine on a standalone
 -- staging network, but a Pattern Repeater grafts another network's contents
 -- onto this one and the list grows with it -- tens of thousands of entries,
--- each a table of label/name/damage/size/nbt. This machine's heap is a couple
--- of hundred kilobytes, so the list alone no longer fits and the node died with
+-- each a table of label/name/damage/size/nbt. When this machine's heap was a
+-- couple of hundred kilobytes the list no longer fit, and the node died with
 -- "not enough memory" before it could read a single count.
 --
--- This node only ever cares about the 32 exact labels below, so ask for them by
--- name. A filtered query is matched on the Java side and hands back a handful
--- of entries, which makes peak memory a function of what we track rather than
--- of how large the ME network happens to be.
+-- Asking for the 32 labels one at a time fixed that, because a filtered query
+-- hands back a handful of entries instead of the whole network. What it did NOT
+-- fix -- and what this section left a reader to assume -- is the cost to the
+-- server. A spark profile of the live world settles it. OC composes the call as
+--
+--   allItems.map(convert).filter(predicate)
+--
+-- so every stack in the network is converted into a Lua table, localised
+-- display name and all, BEFORE the label filter is consulted; and .toArray
+-- traverses that view twice. A filtered query costs the server exactly what an
+-- unfiltered one costs. The filter only shrinks what crosses into Lua.
+--
+-- Thirty-two of them is thirty-two whole-network conversions to learn
+-- thirty-two numbers. The profile put that at 61.2 seconds of a nineteen-minute
+-- capture -- 13% of everything the server did, all of it this node. Each call
+-- is synchronized, so it occupies one server tick: thirty-two back to back is a
+-- burst of heavy ticks every cycle, which is what MSPT was seen oscillating
+-- against. The dust node, one query against a small subnet, cost 0.14s over the
+-- same capture.
+--
+-- So the full pass is the default now, and the per-label path is kept only as a
+-- memory concession -- entered when a full pass cannot be made, never left, and
+-- with its queries spaced across the interval so even that path lands as
+-- isolated ticks instead of one burst.
+--
+-- There is a second reason to prefer the full pass, visible in scanFull below:
+-- it reads the roman numeral out of whatever label the network actually holds,
+-- so it does not care which of the three GTNH drone spellings is in use. The
+-- filtered path has to name the exact string, which is why droneMark has to be
+-- told to this node at all. Preferring the full pass means the common case no
+-- longer depends on the broker having reached us.
 -- =============================================================================
 
 -- Every label worth asking about, and where its count belongs in `assets`.
@@ -521,9 +551,19 @@ end
 
 rebuildDroneLabels()
 
+-- Seconds between scans. Was a bare literal in the event.pull at the bottom of
+-- this file, which left the one cadence here with nothing naming it.
+local SCAN_INTERVAL = 10
+
 -- More entries than any single label could plausibly occupy. A filtered query
 -- that comes back bigger than this was not filtered at all.
 local FILTER_SANE_MAX = 64
+
+-- Fraction of the heap that must be free for a full pass to be worth
+-- attempting. The list is the largest allocation this machine makes, so it
+-- needs room to land; below this we stop trying and take the expensive path
+-- rather than dying mid-scan.
+local MEM_FLOOR = 0.40
 
 -- Total network count for one exact label, or nil if the query failed.
 local function countLabel(label)
@@ -542,34 +582,75 @@ local function countLabel(label)
   return total
 end
 
--- Is the filter actually honoured here? Decided once, at startup.
---
--- If it is not, a filtered call still returns the whole network -- and doing
--- that 32 times a cycle is far worse than the single unfiltered pass we are
--- replacing. So probe once and fall back to one full scan per cycle if the
--- device ignores us.
+-- Has the full pass been given up on? Set once and never cleared: the network
+-- only grows, so a heap that could not take the list will not start being able
+-- to.
 local useFilter = false
-do
+
+-- Is the filter honoured here at all? Probed lazily -- only when the fallback is
+-- first needed -- rather than at startup as it used to be. On the happy path we
+-- never make a filtered query, and the probe would be one whole-network
+-- conversion spent learning something we are not going to use.
+--
+-- If it is NOT honoured, a filtered call returns the entire network anyway, so
+-- there is no fallback to fall back to: we keep attempting full passes and let
+-- them report their own failure. Not a good outcome, but 32 unfiltered calls a
+-- cycle would be a far worse one.
+local filterUsable = nil
+
+local function probeFilter()
+  if filterUsable ~= nil then return filterUsable end
   local ok, items = pcall(me.getItemsInNetwork, { label = drillLabels[1] })
-  useFilter = ok and type(items) == "table" and #items <= FILTER_SANE_MAX
+  filterUsable = ok and type(items) == "table" and #items <= FILTER_SANE_MAX
   items = nil
   gc()
+  return filterUsable
+end
+
+-- Give up on the full pass, permanently, if there is somewhere to go.
+local function demoteToFiltered()
+  if useFilter then return end
+  if probeFilter() then useFilter = true end
 end
 
 -- Why the counts look the way they do, for the status line. A failed query and
--- an empty network are indistinguishable on the board otherwise.
-local scanState = { ok = true, mode = useFilter and "filtered" or "full", err = nil }
+-- an empty network are indistinguishable on the board otherwise. `mode` is also
+-- the only place the expensive path is visible from outside this node.
+local scanState = { ok = true, mode = "full", err = nil }
 
 local function newAssets()
   return { drones = {}, drillTips = {}, drillRods = {} }
 end
 
--- 32 small queries. Returns nil if any of them failed: a partial scan reads as
--- "the network is empty", and ordering against that would fire a craft for
--- every material at once.
+-- One small query per target, spaced out. Returns nil if any of them failed: a
+-- partial scan reads as "the network is empty", and ordering against that would
+-- fire a craft for every material at once.
+--
+-- The spacing is the point of this function's shape. Each query costs the server
+-- a whole-network conversion whether it is filtered or not, so firing them back
+-- to back puts that many consecutive ticks over budget. Spacing them changes
+-- nothing about the total -- this is still the expensive path -- but it lands
+-- the cost as isolated ticks, which is what a tick-rate readout reacts to.
+--
+-- Computed per scan, not once at load: rebuildDroneLabels() replaces
+-- scanTargets whenever the broker sends a different drone marker.
+--
+-- NOT os.sleep(). OpenOS implements that as event.pull with the result thrown
+-- away, so sleeping through most of every cycle would make this node deaf to
+-- the broker -- a DRILL_PAR or HW_QUERY arriving mid-scan would simply vanish.
+-- Pull instead, and hand anything that turns up to the main loop to answer once
+-- the scan is done.
+local deferredEvent = nil
+
 local function scanFiltered()
   local assets = newAssets()
-  for _, t in ipairs(scanTargets) do
+  -- Floor of one tick: a synchronized call cannot go faster than that anyway.
+  local spacing = math.max(0.05, (SCAN_INTERVAL * 0.6) / math.max(1, #scanTargets))
+  for i, t in ipairs(scanTargets) do
+    if i > 1 then
+      local ev = { event.pull(spacing) }
+      if ev[1] and not deferredEvent then deferredEvent = ev end
+    end
     local n = countLabel(t.label)
     if not n then
       scanState = { ok = false, mode = "filtered", err = "query failed: " .. t.label }
@@ -592,6 +673,12 @@ local function scanFull()
 
   local success, itemList = pcall(me.getItemsInNetwork)
   if not success or not itemList then
+    -- "not enough memory" is a different failure from a sick network, and the
+    -- only one changing strategy can help with. Everything else is reported and
+    -- retried unchanged next cycle.
+    if not success and tostring(itemList):find("memory", 1, true) then
+      demoteToFiltered()
+    end
     scanState = { ok = false, mode = "full",
                   err = success and "returned nothing" or tostring(itemList) }
     return nil
@@ -627,6 +714,14 @@ local function scanFull()
   -- Drop the list before anything else allocates against it.
   itemList = nil
   gc()
+
+  -- How close that list came to filling the heap, measured now the worst of the
+  -- allocation is behind us. Notice the squeeze one cycle early, while there is
+  -- still room to change strategy, rather than discovering it as a dead node.
+  if computer.freeMemory() < computer.totalMemory() * MEM_FLOOR then
+    demoteToFiltered()
+  end
+
   scanState = { ok = true, mode = "full", err = nil }
   return assets
 end
@@ -635,6 +730,14 @@ end
 -- nil means "this cycle's numbers are not trustworthy" -- the caller keeps the
 -- previous snapshot rather than acting on a blank one.
 local function scanAssets()
+  -- Do not start a full pass with nowhere to put the result. Checked before the
+  -- call rather than after, because the failure this avoids kills the node.
+  if not useFilter then
+    gc()
+    if computer.freeMemory() < computer.totalMemory() * MEM_FLOOR then
+      demoteToFiltered()
+    end
+  end
   if useFilter then return scanFiltered() end
   return scanFull()
 end
@@ -821,16 +924,38 @@ local function buildPayload(assets)
   return payload
 end
 
+-- When the last scan STARTED. Seeded so the first pass through the loop scans
+-- immediately.
+local lastScan = -SCAN_INTERVAL
+
 while true do
-  -- Scan the ME network for current inventory. A failed scan keeps the previous
-  -- snapshot and skips ordering: a half-read network looks like an empty one,
-  -- and ordering against that would fire a craft for every material at once.
-  local assets = scanAssets()
-  if assets then
-    lastAssets = assets
-    -- Order before drawing and before building the payload, so both reflect
-    -- this cycle's decisions rather than lagging one iteration behind.
-    stepOrders(lastAssets)
+  -- Only rescan once the interval has genuinely elapsed.
+  --
+  -- The header note above is right that this loop wakes irregularly, and right
+  -- that closing port 2026 removed most of the traffic that was waking it. What
+  -- it did not say is that the scan ran on every one of those wakes -- so a
+  -- DRILL_PAR push or a key press did not merely wake the loop, it bought
+  -- another whole-network read. The ten seconds was a floor, not a period.
+  --
+  -- The rest of the body stays where it was and still runs on every wake: the
+  -- dashboard should repaint and the message should be answered promptly. Only
+  -- the scan and the ordering that depends on it are gated.
+  --
+  -- Timed from scan START so a slow scan does not add itself to the period.
+  if computer.uptime() - lastScan >= SCAN_INTERVAL then
+    lastScan = computer.uptime()
+
+    -- Scan the ME network for current inventory. A failed scan keeps the
+    -- previous snapshot and skips ordering: a half-read network looks like an
+    -- empty one, and ordering against that would fire a craft for every
+    -- material at once.
+    local assets = scanAssets()
+    if assets then
+      lastAssets = assets
+      -- Order before drawing and before building the payload, so both reflect
+      -- this cycle's decisions rather than lagging one iteration behind.
+      stepOrders(lastAssets)
+    end
   end
   updateDashboard(lastAssets)
 
@@ -864,7 +989,21 @@ while true do
   -- Pulling everything (like broker-mk3.lua does) keeps both branches working.
   -- Unrelated signals just wake the loop early, which is harmless: the body is
   -- idempotent and every rate limit here is wall-clock, not per-iteration.
-  local ev = { event.pull(10) }
+  local ev
+  if deferredEvent then
+    -- Something arrived while a spaced-out fallback scan was running. Answer it
+    -- now rather than pulling for a fresh one and leaving it unanswered.
+    ev = deferredEvent
+    deferredEvent = nil
+  else
+    -- Wait out what is LEFT of the interval, not a fresh copy of it. On the
+    -- fallback path the scan itself blocks for most of a cycle, and a flat
+    -- SCAN_INTERVAL here would add itself on top and stretch the period to
+    -- nearly twice what it says. The floor keeps this a yield, not a spin.
+    local remaining = SCAN_INTERVAL - (computer.uptime() - lastScan)
+    if remaining < 0.5 then remaining = 0.5 end
+    ev = { event.pull(remaining) }
+  end
   if ev[1] == "key_down" and ev[3] == 3 then -- Ctrl+C
     term.clear()
     os.exit()

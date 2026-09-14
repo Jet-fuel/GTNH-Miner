@@ -371,6 +371,44 @@ Seconds between ME scans on the respective node. Each scan is one
 call is the single most expensive thing those machines do — it builds a table
 entry per stack. Raise these if a node is running short of memory.
 
+Neither is a useful server-performance lever, though, and it is worth knowing
+why before reaching for one.
+
+### What an ME scan actually costs the server
+
+Measured from a spark profile of the live world — 19 minutes, server thread.
+Every OpenComputers component call in the fleet totalled 67.3 s, and one of them
+was 61.16 s of that:
+
+| call | cost | node |
+|---|---|---|
+| `getItemsInNetwork` on the main controller | **61.16 s — 13% of all server tick time** | `hw_telem` |
+| `setInterfaceConfiguration` / `store` | 4.9 s | module loading |
+| `getCraftables` / `request` | 0.7 s | `hw_telem` restocking |
+| `getFluidsInNetwork` | 0.33 s | `fluid_telem` |
+| `getItemsInNetwork` on the dust subnet | **0.14 s** | `dust_telem` |
+
+Two things follow, and neither is intuitive.
+
+**A filtered query costs the server exactly what an unfiltered one costs.**
+OpenComputers composes the call as `allItems.map(convert).filter(predicate)`, so
+every stack in the network is converted into a Lua table — including a
+localisation lookup for its display name — before the filter is consulted, and
+`.toArray` then traverses that view twice. The filter only shrinks what crosses
+into Lua. It is a memory fix, not a speed one.
+
+**So cost tracks the number of calls and the size of the network behind the
+handle.** The dust node makes one call per cycle against a small subnet through
+an ME Interface: 0.14 s across the whole capture. The hw node was making
+thirty-two per cycle against the full Pattern-Repeater-merged network, and cost
+four hundred times as much — as a burst of consecutive heavy ticks every cycle,
+which is what made MSPT visibly oscillate. `hw_telem` now takes one pass per
+cycle and keeps the per-label path only for a heap that cannot hold the list.
+
+The levers, in order of effect: how many calls per cycle, how large the network
+behind the handle is, and only then these intervals. Putting a monitoring node
+on its own small subnet is worth more than any interval you can set here.
+
 ### `wirelessStrength`
 
 Modem range in blocks, applied on the broker and on the dust and fluid nodes.
@@ -544,9 +582,13 @@ about the break ("attempt to call a nil value (field 'setParameters')").
 **The drone item names.** GTNH 2.9 put the voltage in the mining drone's name
 (`Mining Drone MK-IX` → `Mining Drone MK-IX (UHV)`), and beta 3 then lowercased
 the tier marker (→ `Mining Drone Mk-IX (UHV)`). Labels are how every drone is
-resolved — `iface.store{label}` on the loader, `getItemsInNetwork{label}` on the
-hw node — so either half wrong reports **0 of every tier** and the fleet never
-dispatches. On the loader that also surfaces as `fingerprint never confirmed for
+resolved — `iface.store{label}` on the loader, and `getItemsInNetwork{label}` on
+the hw node's per-label fallback path — so either half wrong reports **0 of
+every tier** and the fleet never dispatches. (The hw node's normal path is a
+whole-network pass that reads the roman numeral out of whatever spelling the
+network actually holds, so on the common path a wrong marker no longer zeroes
+the counts. The exact label still has to be right for the loader, and for the
+hw node if it has fallen back.) On the loader that also surfaces as `fingerprint never confirmed for
 drone (...)`, because `store()` cannot resolve a name the network does not have.
 The counting symptom looks exactly like an empty ME network, which is why the
 boot check below exists.
