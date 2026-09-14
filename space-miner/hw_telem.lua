@@ -510,17 +510,38 @@ local gc = type(collectgarbage) == "function" and collectgarbage or function() e
 -- against. The dust node, one query against a small subnet, cost 0.14s over the
 -- same capture.
 --
--- So the full pass is the default now, and the per-label path is kept only as a
--- memory concession -- entered when a full pass cannot be made, never left, and
--- with its queries spaced across the interval so even that path lands as
--- isolated ticks instead of one burst.
+-- Knowing that, the obvious move is one full pass per cycle instead of
+-- thirty-two filtered ones. That was tried on this machine, with its RAM
+-- upgraded, and it does not work: the first pass came back nil ("returned
+-- nothing") and a later one took the node out with "not enough memory". The
+-- merged network is simply larger than this heap can hold in one list, which is
+-- the same wall that produced the per-label design in the first place.
 --
--- There is a second reason to prefer the full pass, visible in scanFull below:
--- it reads the roman numeral out of whatever label the network actually holds,
--- so it does not care which of the three GTNH drone spellings is in use. The
--- filtered path has to name the exact string, which is why droneMark has to be
--- told to this node at all. Preferring the full pass means the common case no
--- longer depends on the broker having reached us.
+-- The important part of that failure is that it is NOT recoverable in code. A
+-- Lua out-of-memory here does not reliably surface as an error you can pcall
+-- and retry differently -- it can stop the machine outright. So the full pass
+-- cannot be attempted speculatively and demoted on failure: by the time you
+-- learn it does not fit, the node is gone. Nor can a free-memory check predict
+-- it; there was headroom by that measure immediately before the pass that died.
+--
+-- So the per-label path stays the default, as it was, and the full pass stays
+-- what it always was: the fallback for a device that ignores the filter. What
+-- has changed is the two things that were costing us for nothing:
+--
+--   1. The queries are spaced across the interval instead of fired back to
+--      back. This does not reduce the total by one millisecond -- it is the
+--      same thirty-two conversions -- but it lands them as isolated ticks
+--      rather than one unbroken burst, which is what MSPT was oscillating
+--      against. The oscillation is the part that was actually hurting.
+--   2. The scan is gated on the wall clock (see the main loop), so an early
+--      wake no longer buys a whole extra scan.
+--
+-- Reducing the total is still open, and both remaining levers cost something
+-- other than code: scan a rotating subset of the labels per cycle and accept
+-- staler counts, or put this node on its own small ME subnet through an
+-- Interface, the way the dust node is -- that node runs the identical query
+-- against a small network and cost 0.14s across the same capture. Nothing
+-- inside this file can make thirty-two whole-network conversions cheap.
 -- =============================================================================
 
 -- Every label worth asking about, and where its count belongs in `assets`.
@@ -559,12 +580,6 @@ local SCAN_INTERVAL = 10
 -- that comes back bigger than this was not filtered at all.
 local FILTER_SANE_MAX = 64
 
--- Fraction of the heap that must be free for a full pass to be worth
--- attempting. The list is the largest allocation this machine makes, so it
--- needs room to land; below this we stop trying and take the expensive path
--- rather than dying mid-scan.
-local MEM_FLOOR = 0.40
-
 -- Total network count for one exact label, or nil if the query failed.
 local function countLabel(label)
   local ok, items = pcall(me.getItemsInNetwork, { label = label })
@@ -582,41 +597,28 @@ local function countLabel(label)
   return total
 end
 
--- Has the full pass been given up on? Set once and never cleared: the network
--- only grows, so a heap that could not take the list will not start being able
--- to.
-local useFilter = false
-
--- Is the filter honoured here at all? Probed lazily -- only when the fallback is
--- first needed -- rather than at startup as it used to be. On the happy path we
--- never make a filtered query, and the probe would be one whole-network
--- conversion spent learning something we are not going to use.
+-- Is the filter actually honoured here? Decided once, at startup, because the
+-- answer decides which path is safe and the unsafe one can kill the node -- so
+-- it has to be known before the first scan, not discovered by surviving one.
 --
--- If it is NOT honoured, a filtered call returns the entire network anyway, so
--- there is no fallback to fall back to: we keep attempting full passes and let
--- them report their own failure. Not a good outcome, but 32 unfiltered calls a
--- cycle would be a far worse one.
-local filterUsable = nil
-
-local function probeFilter()
-  if filterUsable ~= nil then return filterUsable end
+-- If it is not honoured, a filtered call returns the whole network anyway, and
+-- 32 of those a cycle would be far worse than the single full pass they were
+-- meant to replace. So probe once and take the full pass in that case.
+--
+-- The probe costs one whole-network conversion at boot. That is a real cost and
+-- it buys the one fact this file cannot work without.
+local useFilter = false
+do
   local ok, items = pcall(me.getItemsInNetwork, { label = drillLabels[1] })
-  filterUsable = ok and type(items) == "table" and #items <= FILTER_SANE_MAX
+  useFilter = ok and type(items) == "table" and #items <= FILTER_SANE_MAX
   items = nil
   gc()
-  return filterUsable
-end
-
--- Give up on the full pass, permanently, if there is somewhere to go.
-local function demoteToFiltered()
-  if useFilter then return end
-  if probeFilter() then useFilter = true end
 end
 
 -- Why the counts look the way they do, for the status line. A failed query and
 -- an empty network are indistinguishable on the board otherwise. `mode` is also
 -- the only place the expensive path is visible from outside this node.
-local scanState = { ok = true, mode = "full", err = nil }
+local scanState = { ok = true, mode = useFilter and "filtered" or "full", err = nil }
 
 local function newAssets()
   return { drones = {}, drillTips = {}, drillRods = {} }
@@ -671,16 +673,16 @@ local function scanFull()
   gc()
   local assets = newAssets()
 
-  local success, itemList = pcall(me.getItemsInNetwork)
+  -- `why` is the third value on purpose: a nil return is not a throw, so the
+  -- reason arrives alongside the nil rather than in pcall's error slot. This
+  -- used to be dropped, and "returned nothing" on the status line was the whole
+  -- of what a failure told you. dust_telem.lua has read the third value since
+  -- it was written.
+  local success, itemList, why = pcall(me.getItemsInNetwork)
   if not success or not itemList then
-    -- "not enough memory" is a different failure from a sick network, and the
-    -- only one changing strategy can help with. Everything else is reported and
-    -- retried unchanged next cycle.
-    if not success and tostring(itemList):find("memory", 1, true) then
-      demoteToFiltered()
-    end
     scanState = { ok = false, mode = "full",
-                  err = success and "returned nothing" or tostring(itemList) }
+                  err = success and ("returned nil: " .. (why or "no reason given"))
+                                 or tostring(itemList) }
     return nil
   end
 
@@ -714,14 +716,6 @@ local function scanFull()
   -- Drop the list before anything else allocates against it.
   itemList = nil
   gc()
-
-  -- How close that list came to filling the heap, measured now the worst of the
-  -- allocation is behind us. Notice the squeeze one cycle early, while there is
-  -- still room to change strategy, rather than discovering it as a dead node.
-  if computer.freeMemory() < computer.totalMemory() * MEM_FLOOR then
-    demoteToFiltered()
-  end
-
   scanState = { ok = true, mode = "full", err = nil }
   return assets
 end
@@ -730,14 +724,6 @@ end
 -- nil means "this cycle's numbers are not trustworthy" -- the caller keeps the
 -- previous snapshot rather than acting on a blank one.
 local function scanAssets()
-  -- Do not start a full pass with nowhere to put the result. Checked before the
-  -- call rather than after, because the failure this avoids kills the node.
-  if not useFilter then
-    gc()
-    if computer.freeMemory() < computer.totalMemory() * MEM_FLOOR then
-      demoteToFiltered()
-    end
-  end
   if useFilter then return scanFiltered() end
   return scanFull()
 end
