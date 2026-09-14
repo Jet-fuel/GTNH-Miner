@@ -513,21 +513,33 @@ local gc = type(collectgarbage) == "function" and collectgarbage or function() e
 -- gt.metaitem.01 could be most of the ME system, and this node's whole problem
 -- is memory.
 --
--- What "afford" means is measured, not counted. The first version of this
--- judged a group by how many entries it returned, against a fixed ceiling --
--- which is a proxy for memory and a poor one, because entry size depends on the
--- stacks and the ceiling has no idea how much RAM is fitted. It dropped a group
--- that fit comfortably. So each group now records what it actually COST, taken
--- while the list is still held, and is used again only while there is
--- GROUP_HEADROOM times that much free. The entry ceiling stays as a backstop
--- for something pathological, set high enough not to be the thing deciding.
+-- What "afford" means took three attempts to get right, so it is worth saying
+-- what it is NOT.
 --
--- And dropping a group is no longer permanent. It used to be, on the reasoning
--- that a network only grows -- but the heap does not: fit another stick of RAM
--- and the group that was unaffordable this morning is affordable now. A dropped
--- group is retried after GROUP_RETRY_AFTER seconds, and only when there is
--- room for what it cost last time, so the node heals itself instead of sitting
--- on the expensive path until somebody notices and restarts it.
+-- It is not the entry count. That was the first version: a fixed ceiling of
+-- 2000 entries, which is a proxy for memory and a poor one -- entry size
+-- depends on the stacks and a constant in this file cannot know how much RAM is
+-- fitted. It dropped a group that fit comfortably.
+--
+-- It is not a multiple of the group's measured cost either. That was the second
+-- version, and the flaw is subtler: freeBefore minus freeAfter does not measure
+-- the result, it measures the result PLUS whatever garbage marshalling it threw
+-- off, none of which has been collected yet. That over-reads, and then wanting
+-- one and a half times the over-read compounds it. It dropped a group on a heap
+-- with 1.7MB free.
+--
+-- What it is: how close the machine actually came to running out. The free heap
+-- immediately after the call, with the list still held, IS the low-water mark
+-- of the whole operation. If that trough is a healthy fraction of the heap, the
+-- query fit with room to spare, and no arithmetic about what it cost changes
+-- that. GROUP_MIN_TROUGH is that fraction, and it is the only memory test here.
+--
+-- Dropping is not permanent. A network only grows, but the heap does not: fit
+-- another stick of RAM and the group that was unaffordable this morning is
+-- affordable now. A dropped group is retried on a backoff -- five minutes, then
+-- ten, then twenty, capped -- so the node heals itself instead of sitting on the
+-- expensive path until somebody notices, while a group that genuinely never
+-- fits stops costing a retry every five minutes forever.
 --
 -- Two further things that were costing us for nothing:
 --
@@ -578,20 +590,16 @@ local FILTER_SANE_MAX = 64
 -- a count that fits the heap is not a problem however large it looks.
 local GROUP_MAX_ENTRIES = 5000
 
--- How much free heap a group needs, as a multiple of what it cost last time, to
--- be used again. 1.5 means "what it cost, plus half again to grow into".
---
--- Not 2. Two sounds safer and is not: a group costing 900k on a heap with 1759k
--- free fails a 2x test by forty kilobytes and gets dropped, which is a tenfold
--- increase in server cost to avoid a risk that was not there. The thing being
--- guarded against is the result no longer FITTING, and fitting needs one times
--- the cost, not two -- the half is the margin for the network growing between
--- one ten-second scan and the next.
-local GROUP_HEADROOM = 1.5
+-- Fraction of the heap that must still be free at the low-water mark -- that
+-- is, with the result held and nothing collected yet. Below this the query only
+-- just fit, and the next one, against a slightly larger network, might not.
+local GROUP_MIN_TROUGH = 0.15
 
--- Seconds before a dropped group is tried again. Cheap: one query per group per
--- five minutes, and it is what lets a RAM upgrade take effect without a restart.
+-- Backoff for retrying a dropped group: five minutes, then ten, then twenty,
+-- capped. Short enough that fitting more RAM takes effect on its own, long
+-- enough that a group which genuinely never fits is not retried forever.
 local GROUP_RETRY_AFTER = 300
+local GROUP_RETRY_MAX   = 3600
 
 -- Total network count for one exact label, or nil if the query failed.
 -- Returns the network total, and the internal item id the label turned out to
@@ -670,8 +678,9 @@ local deferredEvent = nil
 local labelName  = {}
 local groupIds   = {}
 local groupBad   = {}
-local groupCost  = {}   -- id -> bytes the last result cost
 local groupRetry = {}   -- id -> uptime after which to reconsider it
+local groupFails = {}   -- id -> how many times it has been dropped, for backoff
+local groupWhy   = {}   -- id -> "big" or "mem", for the status line
 
 local function learnName(label, id)
   if not id or labelName[label] then return end
@@ -685,35 +694,29 @@ end
 -- Every tracked label sharing one internal id, in a single query. Returns a
 -- label -> count table, or nil if the query failed or the group turned out to
 -- be too big to keep using.
--- Stop using a group, but leave the door open: record what it cost and when to
--- reconsider, so a heap that grows later can take it back.
-local function dropGroup(id, cost)
+-- Stop using a group, but leave the door open. Each successive drop waits
+-- longer before reconsidering, so a heap that grows later still takes the group
+-- back while one that never will stops paying for the question.
+local function dropGroup(id, why)
   groupBad[id]   = true
-  groupCost[id]  = cost or groupCost[id]
-  groupRetry[id] = computer.uptime() + GROUP_RETRY_AFTER
+  groupWhy[id]   = why
+  groupFails[id] = (groupFails[id] or 0) + 1
+  local wait = GROUP_RETRY_AFTER * (2 ^ (groupFails[id] - 1))
+  if wait > GROUP_RETRY_MAX then wait = GROUP_RETRY_MAX end
+  groupRetry[id] = computer.uptime() + wait
 end
 
 local function countGroup(id)
   gc()
-  local freeBefore = computer.freeMemory()
 
   local ok, items = pcall(me.getItemsInNetwork, { name = id })
   if not ok or type(items) ~= "table" then return nil end
 
-  -- What the result actually cost, taken while the list is still held. This is
-  -- the number the group is judged on; an entry count cannot stand in for it,
-  -- because entry size depends on the stacks and the heap size is not a
-  -- constant of this file.
-  local n    = #items
-  local cost = freeBefore - computer.freeMemory()
-  if cost < 0 then cost = 0 end
-
-  if n > GROUP_MAX_ENTRIES then
-    items = nil
-    gc()
-    dropGroup(id, cost)
-    return nil
-  end
+  -- The low-water mark of the whole operation: the result is held and none of
+  -- the garbage marshalling it produced has been collected. Whatever this query
+  -- was ever going to cost, this is the moment the machine had least left.
+  local trough = computer.freeMemory()
+  local n      = #items
 
   local counts = {}
   for i = 1, n do
@@ -728,12 +731,14 @@ local function countGroup(id)
 
   items = nil
   gc()
-  groupCost[id] = cost
 
-  -- Affordable while there is room to do it again with margin. Measured against
-  -- the heap we have, not against a fraction someone guessed at.
-  if computer.freeMemory() < cost * GROUP_HEADROOM then
-    dropGroup(id, cost)
+  -- Judge it on the trough, and only on the trough. The counting above is kept
+  -- either way -- a group being too expensive to REPEAT is no reason to throw
+  -- away numbers we already have in hand.
+  if n > GROUP_MAX_ENTRIES then
+    dropGroup(id, "big")
+  elseif trough < computer.totalMemory() * GROUP_MIN_TROUGH then
+    dropGroup(id, "mem")
   end
   return counts
 end
@@ -747,12 +752,13 @@ local function scanFiltered()
   -- them, and is how the ids get learned in the first place.
   local groupCalls, labelCalls = {}, {}
   for _, id in ipairs(groupIds) do
-    if groupBad[id]
-       and computer.uptime() >= (groupRetry[id] or 0)
-       and computer.freeMemory() > (groupCost[id] or 0) * GROUP_HEADROOM then
-      -- Conditions have changed since it was dropped -- more RAM fitted, or
-      -- whatever else was holding the heap has gone. Take it back; if it is
-      -- still too expensive, countGroup drops it again and sets a new retry.
+    if groupBad[id] and computer.uptime() >= (groupRetry[id] or 0) then
+      -- Time to ask again. Deliberately unconditional: the reasons a group
+      -- becomes affordable -- RAM fitted, the network shrinking, something else
+      -- letting go of the heap -- are not all things this node can see, and the
+      -- cost of asking is one query against a tenfold difference in what the
+      -- scan costs the server. If it still does not fit, countGroup drops it
+      -- again and the backoff doubles.
       groupBad[id] = nil
     end
     if not groupBad[id] then groupCalls[#groupCalls + 1] = id end
@@ -974,11 +980,15 @@ local function updateDashboard(assets)
     -- 11q where 3q is normal -- but not what, and this is the only place the
     -- difference between "a label is missing" and "a group stopped fitting" is
     -- visible from outside.
-    local dropped = 0
-    for _ in pairs(groupBad) do dropped = dropped + 1 end
+    local dropped, why = 0, nil
+    for id in pairs(groupBad) do
+      dropped = dropped + 1
+      why = groupWhy[id] or why
+    end
     if dropped > 0 then
-      io.write(string.format("  scan %s -%dgrp  free %dk",
-        scanState.mode, dropped, math.floor(computer.freeMemory() / 1024)))
+      io.write(string.format("  scan %s -%dgrp(%s)  free %dk",
+        scanState.mode, dropped, why or "?",
+        math.floor(computer.freeMemory() / 1024)))
     else
       io.write(string.format("  scan %s  free %dk",
         scanState.mode, math.floor(computer.freeMemory() / 1024)))
