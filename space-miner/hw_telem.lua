@@ -508,12 +508,26 @@ local gc = type(collectgarbage) == "function" and collectgarbage or function() e
 -- to learn, so it stays per-label until it appears -- which costs one query and
 -- fixes itself.
 --
--- A group is only worth having while it stays small. The id is shared with
--- every other item of its type, so on another network gt.metaitem.01 could be
--- most of the ME system, and this node's whole problem is memory. A group that
--- comes back larger than GROUP_MAX_ENTRIES, or that leaves the heap under
--- GROUP_MIN_FREE, is abandoned and its labels go back to being asked for one at
--- a time. That decision is measured on the real answer, not guessed.
+-- A group is only worth having while this machine can afford it. The id is
+-- shared with every other item of its type, so on another network
+-- gt.metaitem.01 could be most of the ME system, and this node's whole problem
+-- is memory.
+--
+-- What "afford" means is measured, not counted. The first version of this
+-- judged a group by how many entries it returned, against a fixed ceiling --
+-- which is a proxy for memory and a poor one, because entry size depends on the
+-- stacks and the ceiling has no idea how much RAM is fitted. It dropped a group
+-- that fit comfortably. So each group now records what it actually COST, taken
+-- while the list is still held, and is used again only while there is
+-- GROUP_HEADROOM times that much free. The entry ceiling stays as a backstop
+-- for something pathological, set high enough not to be the thing deciding.
+--
+-- And dropping a group is no longer permanent. It used to be, on the reasoning
+-- that a network only grows -- but the heap does not: fit another stick of RAM
+-- and the group that was unaffordable this morning is affordable now. A dropped
+-- group is retried after GROUP_RETRY_AFTER seconds, and only when there is
+-- room for what it cost last time, so the node heals itself instead of sitting
+-- on the expensive path until somebody notices and restarts it.
 --
 -- Two further things that were costing us for nothing:
 --
@@ -557,16 +571,27 @@ local SCAN_INTERVAL = 10
 -- that comes back bigger than this was not filtered at all.
 local FILTER_SANE_MAX = 64
 
--- Entries a grouped query may return before the group is judged not worth it.
--- The measured worst case here was 1391; this leaves room for the network to
--- grow without leaving room for a group that is effectively the full pass
--- wearing a filter.
-local GROUP_MAX_ENTRIES = 2000
+-- Backstop only. A group returning more entries than this is treated as
+-- pathological -- effectively the full pass wearing a filter -- regardless of
+-- what it cost. The measured group here was 1391 entries; this is deliberately
+-- far above that, because the memory test below is what should be deciding and
+-- a count that fits the heap is not a problem however large it looks.
+local GROUP_MAX_ENTRIES = 5000
 
--- Heap fraction that must survive a grouped query for the group to be used
--- again. Entries are the memory cost and entry size is not knowable in advance,
--- so the count above is a guard and this is the measurement.
-local GROUP_MIN_FREE = 0.25
+-- How much free heap a group needs, as a multiple of what it cost last time, to
+-- be used again. 1.5 means "what it cost, plus half again to grow into".
+--
+-- Not 2. Two sounds safer and is not: a group costing 900k on a heap with 1759k
+-- free fails a 2x test by forty kilobytes and gets dropped, which is a tenfold
+-- increase in server cost to avoid a risk that was not there. The thing being
+-- guarded against is the result no longer FITTING, and fitting needs one times
+-- the cost, not two -- the half is the margin for the network growing between
+-- one ten-second scan and the next.
+local GROUP_HEADROOM = 1.5
+
+-- Seconds before a dropped group is tried again. Cheap: one query per group per
+-- five minutes, and it is what lets a RAM upgrade take effect without a restart.
+local GROUP_RETRY_AFTER = 300
 
 -- Total network count for one exact label, or nil if the query failed.
 -- Returns the network total, and the internal item id the label turned out to
@@ -642,9 +667,11 @@ local deferredEvent = nil
 --   labelName : label -> internal id
 --   groupIds  : the ids we know about, in discovery order
 --   groupBad  : ids abandoned for being too large to be worth a grouped query
-local labelName = {}
-local groupIds  = {}
-local groupBad  = {}
+local labelName  = {}
+local groupIds   = {}
+local groupBad   = {}
+local groupCost  = {}   -- id -> bytes the last result cost
+local groupRetry = {}   -- id -> uptime after which to reconsider it
 
 local function learnName(label, id)
   if not id or labelName[label] then return end
@@ -658,15 +685,33 @@ end
 -- Every tracked label sharing one internal id, in a single query. Returns a
 -- label -> count table, or nil if the query failed or the group turned out to
 -- be too big to keep using.
+-- Stop using a group, but leave the door open: record what it cost and when to
+-- reconsider, so a heap that grows later can take it back.
+local function dropGroup(id, cost)
+  groupBad[id]   = true
+  groupCost[id]  = cost or groupCost[id]
+  groupRetry[id] = computer.uptime() + GROUP_RETRY_AFTER
+end
+
 local function countGroup(id)
+  gc()
+  local freeBefore = computer.freeMemory()
+
   local ok, items = pcall(me.getItemsInNetwork, { name = id })
   if not ok or type(items) ~= "table" then return nil end
 
-  local n = #items
+  -- What the result actually cost, taken while the list is still held. This is
+  -- the number the group is judged on; an entry count cannot stand in for it,
+  -- because entry size depends on the stacks and the heap size is not a
+  -- constant of this file.
+  local n    = #items
+  local cost = freeBefore - computer.freeMemory()
+  if cost < 0 then cost = 0 end
+
   if n > GROUP_MAX_ENTRIES then
     items = nil
     gc()
-    groupBad[id] = true
+    dropGroup(id, cost)
     return nil
   end
 
@@ -683,10 +728,12 @@ local function countGroup(id)
 
   items = nil
   gc()
-  -- Judge the group on what it actually cost, not only on how many entries it
-  -- was. A count that is fine on one machine can still be most of the heap.
-  if computer.freeMemory() < computer.totalMemory() * GROUP_MIN_FREE then
-    groupBad[id] = true
+  groupCost[id] = cost
+
+  -- Affordable while there is room to do it again with margin. Measured against
+  -- the heap we have, not against a fraction someone guessed at.
+  if computer.freeMemory() < cost * GROUP_HEADROOM then
+    dropGroup(id, cost)
   end
   return counts
 end
@@ -700,6 +747,14 @@ local function scanFiltered()
   -- them, and is how the ids get learned in the first place.
   local groupCalls, labelCalls = {}, {}
   for _, id in ipairs(groupIds) do
+    if groupBad[id]
+       and computer.uptime() >= (groupRetry[id] or 0)
+       and computer.freeMemory() > (groupCost[id] or 0) * GROUP_HEADROOM then
+      -- Conditions have changed since it was dropped -- more RAM fitted, or
+      -- whatever else was holding the heap has gone. Take it back; if it is
+      -- still too expensive, countGroup drops it again and sets a new retry.
+      groupBad[id] = nil
+    end
     if not groupBad[id] then groupCalls[#groupCalls + 1] = id end
   end
   for _, t in ipairs(scanTargets) do
@@ -915,8 +970,19 @@ local function updateDashboard(assets)
   term.setCursor(2, 21)
   if scanState.ok then
     gpu.setForeground(0x555555)
-    io.write(string.format("  scan %s  free %dk",
-      scanState.mode, math.floor(computer.freeMemory() / 1024)))
+    -- Flag dropped groups. The query count alone says something is wrong --
+    -- 11q where 3q is normal -- but not what, and this is the only place the
+    -- difference between "a label is missing" and "a group stopped fitting" is
+    -- visible from outside.
+    local dropped = 0
+    for _ in pairs(groupBad) do dropped = dropped + 1 end
+    if dropped > 0 then
+      io.write(string.format("  scan %s -%dgrp  free %dk",
+        scanState.mode, dropped, math.floor(computer.freeMemory() / 1024)))
+    else
+      io.write(string.format("  scan %s  free %dk",
+        scanState.mode, math.floor(computer.freeMemory() / 1024)))
+    end
   else
     gpu.setForeground(0xFF4444)
     io.write(string.sub("  SCAN FAILED: " .. (scanState.err or "?"), 1, 36))
