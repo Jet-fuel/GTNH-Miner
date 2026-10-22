@@ -32,8 +32,8 @@
 --   0 = bottom (down)   1 = top (up)
 --   2 = north           3 = south
 --   4 = west            5 = east
--- The sides depend on your physical build — verify them per module.
--- (detect_module.lua prompts for these and shows this legend.)
+-- The sides depend on your physical build. detect_module.lua probes them for
+-- you; `detect_module fix` re-checks them later.
 -- =============================================================================
 
 return {
@@ -41,7 +41,7 @@ return {
   dbAddr = "",        -- leave blank: detect_module auto-detects your database
   modules = {
     -- Leave this EMPTY and let detect_module.lua populate it — run it once per
-    -- module (connect the module's 3 components, run detect_module, verify, repeat).
+    -- module (connect the module's components, run detect_module, repeat).
     --
     -- For reference, each module entry looks like this (detect_module writes them
     -- for you, so you normally don't edit this by hand):

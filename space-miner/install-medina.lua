@@ -44,7 +44,7 @@ local ROLES = {
     files = { "config.lua", "settings.lua",
               "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
               "module_api.lua", "editor.lua",
-              "list_components.lua", "detect_module.lua", "detect_sides.lua", "find_item.lua",
+              "list_components.lua", "detect_module.lua", "find_item.lua",
               "migrate_drill.lua" },
     config = { ["job_node_config.example.lua"] = "job_node_config.lua" },
     note = "Edit /home/job_node_config.lua with your hardware, then run: broker-mk3",
@@ -68,7 +68,7 @@ local ROLES = {
     label = "Remote job node (optional, multi-node fleets)",
     files = { "config.lua", "settings.lua",
               "job_node.lua", "module_api.lua", "list_components.lua", "detect_module.lua",
-              "detect_sides.lua", "find_item.lua" },
+              "find_item.lua" },
     config = { ["job_node_config.example.lua"] = "job_node_config.lua" },
     note = "Edit /home/job_node_config.lua (give it a unique nodeId), then run: job_node",
   },
@@ -216,7 +216,7 @@ if choice == 6 then
   local everything = {
     "config.lua", "settings.lua", "reference.lua",
     "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
-    "list_components.lua", "detect_module.lua", "detect_sides.lua", "find_item.lua",
+    "list_components.lua", "detect_module.lua", "find_item.lua",
     "dust_telem.lua", "hw_telem.lua", "fluid_telem.lua", "job_node.lua",
     "migrate_drill.lua",
   }

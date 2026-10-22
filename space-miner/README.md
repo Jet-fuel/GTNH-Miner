@@ -498,7 +498,7 @@ Four files, one writer each. They never overwrite each other.
 | `config.lua` | this repo | shipped tables plus the generated `asteroidOutputs` block. Regenerated wholesale, so never hand-edit it in game. |
 | `settings.lua` | this repo | the declarations every tunable is defined by: type, range, default, one-line help. Also regenerated wholesale. |
 | `user_config.lua` | the in-game editor (press `E`) | what you track, dust→asteroid mappings you added, your drill par, and every setting you changed. Safe to hand-edit — the editor writes only what differs from the shipped values, so a hand-edit survives a save. |
-| `job_node_config.lua` | `detect_module` / `detect_sides` | your hardware addresses and transposer sides. |
+| `job_node_config.lua` | `detect_module` | your hardware addresses, transposer sides and stocking bus. |
 
 Nothing in this list needs to be edited by hand to run the system. That is the
 point of the editor: press `E`, change what you want, press `s`, and it applies

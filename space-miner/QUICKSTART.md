@@ -137,16 +137,22 @@ list_components
 Then add your modules **one at a time** with the helper:
 
 1. Hook up one module's three parts (module adapter, interface adapter, transposer).
+   For `stockingMode = filter`, also an adapter touching the stocking bus, or an
+   adapter holding an MFU bound to it.
 2. Run:
    ```
    detect_module
    ```
-3. It finds the three new components, shows the proposed module, and asks you to
-   confirm. Type `y`.
-4. **Verify the two side numbers** it shows (`interfaceSide` / `inputBusSide`). It
-   copies these from your previous module as a guess — correct them if this module
-   faces a different direction.
-5. Repeat for each module: **hook up → `detect_module` → verify → confirm.**
+3. It finds the new components, reads the tier, and works out the transposer
+   sides (and the stocking bus, if attached) by borrowing a drill tip or rod from
+   the ME network and watching where it lands. Then it writes the module. There
+   is nothing to answer.
+4. Repeat for each module: **hook up → `detect_module`.**
+
+If a module's wiring changes later, `detect_module fix` re-checks every module
+(or `detect_module fix 3` just one) and writes any corrections. A regular
+stocking bus only pulls while its machine runs, so to find a bus, run `fix` with
+the module on.
 
 ---
 

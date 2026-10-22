@@ -257,15 +257,11 @@ How a running module's drill tips and rods get into its input bus. Default
 Filter mode needs the bus reachable from the broker: either an adapter touching
 the stocking bus, or an adapter holding an MFU bound to it. Both appear as the
 same `me_inputbus` component. Its address goes in the module's config entry as
-`busAddr` (`job_node_config.lua`), and the detection scripts fill it in:
-
-- `detect_module` takes it when exactly one new bus is attached alongside the
-  module's other new components.
-- `detect_sides` answers **y** to "Also find each module's stocking bus" and
-  probes: it sets the probe item as a filter on each unclaimed bus and watches
-  which one shows up on that module's transposer face. If none does, it lists
-  the buses and asks. A regular stocking bus only pulls while its machine runs,
-  so run it with the module on, or pick by hand.
+`busAddr` (`job_node_config.lua`), and `detect_module` fills it in: it sets
+its probe item as a filter on each unclaimed bus and watches which one shows up
+on that module's transposer face. A regular stocking bus only pulls while its
+machine runs, so if a new module's bus is not found, start the module and run
+`detect_module fix`.
 
 A module without `busAddr` keeps transferring and logs a warning once, so one
 unconfigured module does not hold the others back.
