@@ -17,8 +17,9 @@
 --   - ONE OC Database (slots partitioned per module: M1->1-3, M2->4-6, ...)
 --   - Per-module: Adapter (module controller), Adapter (ME interface), Transposer
 --
--- Requires: /home/scheduler.lua, /home/loader.lua,
---           /home/job_node_config.lua, /home/config.lua, /home/logger.lua
+-- Requires: /home/scheduler.lua, /home/loader.lua, /home/module_api.lua,
+--           /home/editor.lua, /home/job_node_config.lua, /home/config.lua,
+--           /home/logger.lua
 -- =============================================================================
 
 local component     = require("component")
@@ -31,6 +32,8 @@ local computer      = require("computer")
 local config        = dofile("/home/config.lua")
 local sched         = dofile("/home/scheduler.lua")
 local loader        = dofile("/home/loader.lua")
+local moduleApi     = dofile("/home/module_api.lua")
+local editor        = dofile("/home/editor.lua")
 
 local loggingModule = dofile("/home/logger.lua")
 assert(loggingModule and loggingModule.createLogger, "logger.lua not loaded")
@@ -39,16 +42,14 @@ local getUnixTime = loggingModule.getCurrentTimestamp
 
 logger:info("========== BROKER-MK3 (v1.5) STARTUP ==========")
 
--- Surface task crashes in the log instead of swallowing them.
--- CRITICAL: also set loadResult so the module doesn't get stuck in LOADING forever.
-sched.onError = function(name, err)
-  logger:error("[TASK] " .. tostring(name) .. " crashed: " .. tostring(err))
-  -- Find the module whose load task just crashed and mark it failed.
-  for _, mod in ipairs(modules) do
-    if mod.status == "LOADING" and not mod.loadResult then
-      mod.loadResult = { ok = false, err = "task crashed: " .. tostring(err) }
-    end
-  end
+-- Anything user_config.lua asked for that could not be honoured -- an unknown
+-- key, or a value outside the bounds its declaration allows. config.lua carries
+-- on with the default rather than refusing to boot, but silence here would mean
+-- an edit that quietly did nothing, so say so on the console as well as the log.
+for key, why in pairs(config.settingsRejected or {}) do
+  local line = "user_config.lua: ignoring " .. key .. " (" .. why .. ")"
+  logger:warn(line)
+  print(line)
 end
 
 -- =============================================================================
@@ -60,7 +61,7 @@ local modem = component.modem
 if not modem.isWireless or not modem.isWireless() then
   error("Requires a T2 Wireless Network Card.")
 end
-modem.setStrength(400)
+modem.setStrength(config.wirelessStrength)
 modem.open(config.ports.telemetry)
 logger:info("Modem listening on port " .. config.ports.telemetry)
 
@@ -109,11 +110,42 @@ for i, mc in ipairs(nodeConf.modules) do
     inactiveSinceAt = nil,
     nextHeartbeatAt = 0,
     lastRunWarnAt   = 0,
+    -- Which GTNH parameter API this module's controller speaks. Filled in by
+    -- initModules() from config.gtVersion -- not probed; see module_api.lua for
+    -- why the drone label forced that. Still nil for a module whose adapter
+    -- answers neither dialect, which must be reported on the dashboard rather
+    -- than erroring the whole boot.
+    dialect         = nil,
+    dialectHow      = nil,
   }
 end
 
 -- (Modules are disabled/cleared after the dashboard frame is drawn, so boot
 --  shows progress instead of a blank console. See initModules() below.)
+
+-- Surface task crashes in the log instead of swallowing them, and mark the
+-- module failed so it does not sit in LOADING forever.
+--
+-- DEFINED HERE, BELOW `modules`, AND THAT POSITION IS THE WHOLE POINT. This
+-- handler used to be assigned up beside the logger, forty lines before
+-- `local modules` existed -- so the closure captured the GLOBAL `modules`, which
+-- is nil. Every task crash then threw `ipairs(nil)` inside the scheduler's
+-- `pcall(scheduler.onError, ...)`, where it was swallowed: the log line above
+-- was written, loadResult was never set, pollLoad returned early forever, and
+-- the module stayed in LOADING until the broker was restarted. The comment
+-- claiming to prevent exactly that was the only part of it that worked.
+--
+-- space-pumping/autoPump.lua has the same handler ordered correctly; this now
+-- matches it.
+sched.onError = function(name, err)
+  logger:error("[TASK] " .. tostring(name) .. " crashed: " .. tostring(err))
+  -- Find the module whose load task just crashed and mark it failed.
+  for _, mod in ipairs(modules) do
+    if mod.status == "LOADING" and not mod.loadResult then
+      mod.loadResult = { ok = false, err = "task crashed: " .. tostring(err) }
+    end
+  end
+end
 
 -- =============================================================================
 -- BROKER STATE
@@ -128,6 +160,12 @@ local brokerState = {
   -- wholesale from HW_UPDATE -- see processMessage() -- so an entry that
   -- resolves itself (a craft lands, a pattern gets added) disappears on its own.
   crafting = {},
+  -- payloadType -> reason, for a node that has given up publishing figures.
+  -- Non-empty means dispatch is held; the panels name the node and the reason.
+  nodeError = {},
+  -- payloadType -> how many scans ago the figures we hold were fresh. Set while
+  -- a node is coping with a transient fault; dispatch continues.
+  nodeRecast = {},
   jobs = {},
   -- itemName -> asteroid, for needs no drone in stock can reach. Rebuilt every
   -- dispatch so it clears itself the moment a suitable drone appears.
@@ -321,22 +359,18 @@ local drillKeyOrder = {
 local function usableDrillKeys()
   local keys = {}
 
-  -- Drones sitting in the staging network.
-  for droneKey, count in pairs(brokerState.drones) do
-    if (count or 0) > 0 then
+  -- Every drone the fleet owns, whether it is in the network or in a module.
+  --
+  -- This used to read the ME figure and then re-add "anything a busy module is
+  -- holding", because a drone loaded into a running module reports as zero and
+  -- dropping its material from par mid-run is exactly backwards -- that is the
+  -- material actively being consumed. The declared fleet does not go missing
+  -- while it is being used, so the second loop is gone with the reason for it.
+  for droneKey, count in pairs(config.droneStock or {}) do
+    if (tonumber(count) or 0) > 0 then
       local tier = config.droneTierKeys[droneKey]
       local dk   = tier and config.droneDrillMap[tier]
       if dk then keys[dk] = true end
-    end
-  end
-
-  -- Plus anything a busy module is holding. A drone loaded into a running
-  -- module is NOT in the ME network, so it reports zero above -- and dropping
-  -- its material from par mid-run is exactly backwards, since that is the
-  -- material actively being consumed.
-  for _, mod in ipairs(modules) do
-    if mod.status ~= "IDLE" and mod.job and mod.job.drillKey then
-      keys[mod.job.drillKey] = true
     end
   end
 
@@ -371,12 +405,56 @@ local PW = P2 - 2
 -- it is fully shown; without this the overflow was simply invisible.
 local dustScroll = 0
 
+-- Dispatch pause. Stops the broker STARTING work; it never interrupts a module
+-- already mining, which is the same bargain the editor's quiesce makes and for
+-- the same reason -- a drone and a kit are already committed, and dropping the
+-- run wastes both.
+--
+-- Session state, not a setting. "I am standing here doing maintenance" is not
+-- something a restart should remember, and a broker that came back up silently
+-- refusing to dispatch would look exactly like a broken one.
+local dispatchPaused = false
+
+-- Header buttons, on the row between the title and the panel headings.
+--
+-- OpenComputers delivers a screen click as a "touch" signal carrying the cell
+-- it landed in, so a button here is a rectangle of text plus its bounds --
+-- there is no widget layer to hang one off and nothing to register.
+--
+-- Fixed widths, because the pause button's label changes length: sized to its
+-- text it would leave the tail of "RESUME" on screen after switching back to
+-- "PAUSE", since dashRow only clears the width it is given.
+--
+-- Both buttons keep their key equivalents (E and P). A tier 1 screen cannot
+-- report a touch at all, so a button is the second way in, never the only one.
+local BTN_Y        = 3
+local BTN_SETTINGS = { x = 2,  w = 12 }
+local BTN_PAUSE    = { x = 16, w = 12 }
+local BTN_STATUS_X = 30
+-- Clamped to the screen: a tier 1 display is 50 columns, and a status strip
+-- sized for a tier 3 one would be asking gpu.fill to write past the edge.
+local BTN_STATUS_W = math.max(0, math.min(40, W - BTN_STATUS_X))
+
+local function btnHit(b, x, y)
+  return y == BTN_Y and x and x >= b.x and x < b.x + b.w
+end
+
+-- How to open the editor right now, in words. Any message that tells someone to
+-- go and change a setting has to name a way in that actually works -- "press E"
+-- is a dead end once the key is switched off.
+local function editorWayIn()
+  if config.hotkeyEditor then return "press E, or click SETTINGS" end
+  return "click SETTINGS on the header"
+end
+
 -- Every interval from here down is REAL SECONDS against computer.uptime().
 -- They used to be compared against os.time(), which in OpenOS is world time, not
 -- real time -- so "0.2" and "10" were in a unit nobody had established and the
 -- waits they produced were whatever they happened to be. The scheduler's own
 -- header says not to mix the two; the lifecycle was doing it anyway.
-local DISPATCH_INTERVAL = 0.2
+-- Cadences live in settings.lua and are edited in game; they are read live from
+-- `config` at every use rather than copied into a local here, so an edit takes
+-- effect on the next pass instead of the next reboot.
 local lastDispatchCheck = 0
 local ERROR_TIMEOUT = 5      -- before a faulted module is recovered and reused
 local lastErrorTime = {}
@@ -465,12 +543,28 @@ local function returnItemsToME(mod)
       mod.transposer.transferItem(mod.conf.inputBusSide, mod.conf.interfaceSide, size, slot)
     end
   end
+
+  -- Nothing is recorded here any more. This used to stamp mod.returned so the
+  -- pool could count a drone that had left the bus but not yet reached the
+  -- network -- a blind spot that only existed because the pool was derived from
+  -- what the ME could see. It is derived from the declared fleet now, and a
+  -- drone in transit never stopped being counted, so there is nothing to
+  -- remember. (The stamp was also wrong: it recorded the drone the JOB wanted,
+  -- not the one the bus HELD, so a failed load -- where no drone ever
+  -- arrived -- credited one that did not exist.)
 end
 
+-- One implementation, in loader.lua, because the loader is what allocates these
+-- slots and so is the only thing that knows how many are in use. This used to be
+-- a second copy that always cleared exactly three while the loader could
+-- allocate up to eight -- so a load with a start threshold above one stack could
+-- leave slots 4-8 configured, with the ME quietly stocking consumables into a
+-- bus that was finished with them.
+--
+-- Costs the same as the old three-slot version in the shipped configuration:
+-- see the note on loader.clearInterfaceSlots.
 local function clearInterfaceSlots(mod)
-  mod.iface.setInterfaceConfiguration(1)
-  mod.iface.setInterfaceConfiguration(2)
-  mod.iface.setInterfaceConfiguration(3)
+  loader.clearInterfaceSlots(mod)
 end
 
 local function getOptimalDistance(moduleTier, asteroid, droneKey)
@@ -548,14 +642,14 @@ local function pollLoad(mod)
     mod.lastLoad = string.format("%.0fs pre%.0f fill%.0f w%d @%d/%d db%d buf%d",
       elapsed, s.preDrainSecs or 0, s.fillSecs or 0, s.fillWaits or 0,
       sw.tips or 0, sw.rods or 0, maxConfirm, s.arrivePolls or 0)
-    logger:info(string.format(
+    logger:info(
       "[LOAD] M%d %.1fs = pre %.1fs + fill %.1fs (%d passes, %d waiting) start %d/%d",
       mod.index, elapsed, s.preDrainSecs or 0, s.fillSecs or 0,
-      s.fillPasses or 0, s.fillWaits or 0, sw.tips or 0, sw.rods or 0))
-    logger:info(string.format(
+      s.fillPasses or 0, s.fillWaits or 0, sw.tips or 0, sw.rods or 0)
+    logger:info(
       "[LOAD] M%d ready (confirm polls d=%s t=%s r=%s, arrive=%s)",
       mod.index, tostring(cp.drone), tostring(cp.tip), tostring(cp.rod),
-      tostring(s.arrivePolls)))
+      tostring(s.arrivePolls))
     mod.status = "RUNNING"
     mod.runStartedAt = computer.uptime()
     mod.lastRunPollAt = 0
@@ -564,35 +658,35 @@ local function pollLoad(mod)
     mod.nextHeartbeatAt = computer.uptime() + RUN_HEARTBEAT_INTERVAL
     mod.lastRunWarnAt = 0
     mod.job.startTime = computer.uptime()
-    logger:info(string.format(
+    logger:info(
       "[HEALTH] M%d started asteroid=%s dist=%s x%s",
       mod.index,
       tostring(mod.job and mod.job.asteroid or "?"),
       tostring(mod.job and mod.job.distance or "?"),
-      tostring(mod.job and mod.job.parallels or "?")))
-    -- GTNH 2.9: set all required named parameters before enabling.
-    -- Keys confirmed live via getParameters() on an MK-II:
-    --   cycle (bool), cycleDistance, distance, parallel, range, step
-    -- "cycle=false" pins a static distance; with cycle on, the module sweeps
-    -- between distance-range and distance+range and getOptimalDistance's choice
-    -- stops meaning anything.
-    --
-    -- pcall is deliberate and not upstream's: a nil setParameter is exactly what
-    -- took this broker down before, and a crash in pollLoad kills all six
-    -- modules. On failure this one goes ERROR and the rest keep mining.
-    local okParams, paramErr = pcall(function()
-      mod.adapter.setParameter("distance", mod.job.distance)
-      mod.adapter.setParameter("parallel", mod.job.parallels or 1)
-      mod.adapter.setParameter("cycle", false)
-    end)
+      tostring(mod.job and mod.job.parallels or "?"))
+    -- Set every parameter the run needs, in whichever dialect this module
+    -- speaks. module_api.lua holds the 2.8/2.9 difference and does the pcall'ing
+    -- -- the reasoning for that guard is written out there, and it is the same
+    -- reasoning as the gate below.
+    local okParams, paramErr = moduleApi.configure(mod, mod.job)
     if not okParams then
       mod.status = "ERROR"
-      mod.lastError = "setParameter: " .. tostring(paramErr)
-      logger:error("[LOAD] M" .. mod.index .. " setParameter failed: " .. tostring(paramErr))
+      mod.lastError = tostring(paramErr)
+      logger:error("[LOAD] M" .. mod.index .. " parameters failed: " .. tostring(paramErr))
       return
     end
 
-    mod.adapter.setWorkAllowed(true)
+    -- pcall'd for the same reason module_api.configure is: this runs inside
+    -- pollLoad, and a throw in pollLoad takes down the main loop and with it
+    -- every other module. The guard used to stop one line short of the call that
+    -- actually opens the gate.
+    local okGate, gateErr = pcall(function() mod.adapter.setWorkAllowed(true) end)
+    if not okGate then
+      mod.status = "ERROR"
+      mod.lastError = "setWorkAllowed: " .. tostring(gateErr)
+      logger:error("[LOAD] M" .. mod.index .. " setWorkAllowed failed: " .. tostring(gateErr))
+      return
+    end
     mod.enabledAt     = computer.uptime()
     mod.refills       = 0
     mod.bufferFilled  = false
@@ -621,6 +715,11 @@ end
 --   never re-dispatched -- so topping up forever silently pins every module to
 --   whatever asteroid it first picked up and the broker stops responding to
 --   what is actually low. Returns true once the buffer is full.
+-- WHEN and WHAT to top up. The HOW -- reading the inventories and moving the
+-- items -- is loader.topUp, next to drain(), which is the same job and had the
+-- same lesson learned in it years earlier. This function used to do both, and
+-- its half of the work asked the hardware the same question four times per
+-- consumable per pass.
 local function restockRunning(mod)
   if mod.status ~= "RUNNING" or not mod.job then return end
   local drill = config.drills[mod.job.drillKey]
@@ -629,154 +728,37 @@ local function restockRunning(mod)
   local TIPS_PER = config.tipsPerLoad or 64
   local RODS_PER = config.rodsPerLoad or 64
   local _, slotTip, slotRod = loader.dbSlotsFor(mod.index)
-  local ibufSize = mod.transposer.getInventorySize(mod.conf.interfaceSide) or 9
-  local busSize = mod.transposer.getInventorySize(mod.conf.inputBusSide) or 16
 
-  -- Count ALL of `label` across the whole bus, not one fixed slot. If we only
-  -- checked a fixed slot and the item had shifted, we'd read 0 and re-pull a full
-  -- stack every cycle — silently draining the ME and starving other modules.
-  -- One call per inventory, not one per slot. These three loops ran every few
-  -- seconds for every running module, and the findBuf one ran inside a five
-  -- second await polled five times a second -- so a single refill could spend
-  -- a couple of hundred component calls doing nothing but waiting, while the
-  -- loaders were queueing for the same budget.
-  -- Falls back to per-slot reads if loader.lua predates snapshotSide, so a
-  -- half-updated /home (new broker, old loader) is slow rather than broken.
-  local snap = loader.snapshotSide or function(m, side, from, to)
-    local out = {}
-    for sl = from, to do out[sl] = m.transposer.getStackInSlot(side, sl) end
-    return out
+  local wanted = {
+    { label = drill.tip, target = TIPS_PER, cfgSlot = 2, dbSlot = slotTip },
+    { label = drill.rod, target = RODS_PER, cfgSlot = 3, dbSlot = slotRod },
+  }
+
+  local results, totals, moved = loader.topUp(mod, wanted, dbAddr)
+
+  if moved then
+    mod.refills        = (mod.refills or 0) + 1
+    cycleStats.refills = (cycleStats.refills or 0) + 1
   end
-
-  local function busTotal(label)
-    local total, firstSlot = 0, nil
-    local inv = snap(mod, mod.conf.inputBusSide, 1, busSize)
-    for s = 1, busSize do
-      local st = inv[s]
-      if st and st.label == label then
-        total = total + (st.size or 0)
-        firstSlot = firstSlot or s
-      end
-    end
-    return total, firstSlot
-  end
-
-  local function findBuf(label)
-    local inv = snap(mod, mod.conf.interfaceSide, 1, ibufSize)
-    for s = 1, ibufSize do
-      local stack = inv[s]
-      if stack and stack.label == label then return s, stack.size or 0 end
-    end
-    return nil, 0
-  end
-
-  -- Where should a refill land? Prefer a partly filled stack of the same item,
-  -- otherwise the first empty slot. busTotal already counts the whole bus, but
-  -- the transfer used to target the FIRST slot holding the item -- which, once a
-  -- load spans more than one stack, is usually the full one, so the move landed
-  -- nothing and the module ran dry anyway. Slot 1 is the drone; start at 2.
-  local function destFor(label)
-    local firstEmpty
-    local inv = snap(mod, mod.conf.inputBusSide, 1, busSize)
-    for s = 2, busSize do
-      local st = inv[s]
-      if not st or (st.size or 0) == 0 then
-        firstEmpty = firstEmpty or s
-      elseif st.label == label then
-        local room = (st.maxSize or 64) - (st.size or 0)
-        if room > 0 then return s, room end
-      end
-    end
-    if firstEmpty then return firstEmpty, 64 end
-    return nil, 0
-  end
-
-  -- Did this pass actually move anything? A top-up that moves nothing is the ME
-  -- not delivering, not a refill, and counting it would make the stat lie.
-  local movedAny = false
-
-  -- Refill one consumable in the bus back up to `target` from the ME interface.
-  --
-  -- Returns "done" when at target, "nofit" when the bus has no room for more,
-  -- and "partial" otherwise. The caller needs the difference: "nofit" is not a
-  -- failure to retry, it is the bus being physically full, and retrying it every
-  -- three seconds for the whole top-up window achieves nothing.
-  local function refill(label, target, cfgSlot, dbSlot)
-    if mod.status ~= "RUNNING" then return "partial" end
-    local have = busTotal(label)
-    local deficit = target - have
-    if deficit <= 0 then return "done" end
-    local dst, room = destFor(label)
-    if not dst then
-      -- Nowhere to put it. 128 of each needs two slots per consumable plus one
-      -- for the drone, so a bus with fewer than five usable slots simply cannot
-      -- hold a full buffer of both.
-      return "nofit"
-    end
-    -- One stack at a time: that is all an interface buffer slot holds.
-    mod.iface.setInterfaceConfiguration(cfgSlot, dbAddr, dbSlot, math.min(deficit, 64))
-    -- Half a second between checks, not a fifth. Each check is one call now
-    -- rather than nine, but the ME is not going to answer faster for being
-    -- asked more often, and this runs concurrently with every other module.
-    sched.await(function() return (select(1, findBuf(label))) ~= nil end, 5, 0.5)
-    if mod.status ~= "RUNNING" then
-      mod.iface.setInterfaceConfiguration(cfgSlot)
-      return "partial"
-    end
-    local src = select(1, findBuf(label))
-    if src then
-      -- Re-pick the destination: the module has been consuming while we waited.
-      local d, r = destFor(label)
-      if d then
-        local got = mod.transposer.transferItem(mod.conf.interfaceSide,
-                      mod.conf.inputBusSide, math.min(deficit, r), src, d)
-        if (got or 0) > 0 then movedAny = true end
-      end
-    end
-    if busTotal(label) >= target then
-      -- Done with this consumable: release the slot so the interface stops
-      -- holding stock we no longer need.
-      mod.iface.setInterfaceConfiguration(cfgSlot)
-      return "done"
-    end
-
-    -- LEAVE THE ORDER STANDING.
-    --
-    -- Clearing here cancelled it, and the next pass three seconds later placed
-    -- the same order again -- so a network that hands over a few items at a time
-    -- had its progress thrown away on every pass and started over. Measured in
-    -- world at 3.6 refills per cycle to move a single stack.
-    --
-    -- Standing, the interface keeps accumulating between passes and the next one
-    -- collects whatever arrived. stepDone clears every configuration slot when
-    -- the run ends, so nothing is left hoarding.
-    return "partial"
-  end
-
-  local tipState = refill(drill.tip, TIPS_PER, 2, slotTip)
-  local rodState = refill(drill.rod, RODS_PER, 3, slotRod)
 
   -- Stop asking once each consumable is either at target or cannot fit. Waiting
   -- for both to reach target meant a bus too small for two full stacks retried
   -- for the entire window and never finished -- which looked like "sometimes it
   -- does not top up at all".
-  if movedAny then
-    mod.refills      = (mod.refills or 0) + 1
-    cycleStats.refills = (cycleStats.refills or 0) + 1
-  end
-
+  local tipState, rodState = results[1], results[2]
   local settled = (tipState ~= "partial") and (rodState ~= "partial")
   if settled then
-    local tips, rods = busTotal(drill.tip), busTotal(drill.rod)
-    logger:info(string.format(
-      "[RESTOCK] M%d settled at tips %d/%d (%s), rods %d/%d (%s)",
-      mod.index, tips, TIPS_PER, tipState, rods, RODS_PER, rodState))
+    -- `totals` came back from the pass that just ran. The old code re-read the
+    -- whole bus twice here purely to build this line -- every three seconds,
+    -- forever, on a pinned module that had nothing left to do.
+    logger:info("[RESTOCK] M%d settled at tips %d/%d (%s), rods %d/%d (%s)",
+      mod.index, totals[drill.tip] or 0, TIPS_PER, tipState,
+      totals[drill.rod] or 0, RODS_PER, rodState)
     if tipState == "nofit" or rodState == "nofit" then
-      logger:warn(string.format(
-        "[RESTOCK] M%d input bus has no room for a full buffer -- it needs %d free slots " ..
+      logger:warn("[RESTOCK] M%d input bus has no room for a full buffer -- it needs %d free slots " ..
         "(drone + %d stacks of tips + %d stacks of rods)",
         mod.index, 1 + math.ceil(TIPS_PER / 64) + math.ceil(RODS_PER / 64),
-        math.ceil(TIPS_PER / 64), math.ceil(RODS_PER / 64)))
+        math.ceil(TIPS_PER / 64), math.ceil(RODS_PER / 64))
     end
   end
   return settled
@@ -825,7 +807,7 @@ local function stepRunning(mod)
         cycleStats.spinTime = (cycleStats.spinTime or 0) + spin
         cycleStats.spins    = (cycleStats.spins or 0) + 1
         if spin > (cycleStats.spinMax or 0) then cycleStats.spinMax = spin end
-        logger:info(string.format("[SPINUP] M%d running %.2fs after enable", mod.index, spin))
+        logger:info("[SPINUP] M%d running %.2fs after enable", mod.index, spin)
       end
     end
   end
@@ -871,18 +853,18 @@ local function stepRunning(mod)
   if isActive then
     if mod.inactiveStreak and mod.inactiveStreak > 0 and mod.inactiveSinceAt then
       local downFor = now - mod.inactiveSinceAt
-      logger:warn(string.format(
+      logger:warn(
         "[HEALTH] M%d recovered after %.1fs inactive blip (streak=%d)",
-        mod.index, downFor, mod.inactiveStreak))
+        mod.index, downFor, mod.inactiveStreak)
     end
     mod.inactiveStreak = 0
     mod.inactiveSinceAt = nil
     if now >= (mod.nextHeartbeatAt or 0) then
-      logger:info(string.format(
+      logger:info(
         "[HEALTH] M%d running asteroid=%s for %.0fs",
         mod.index,
         tostring(mod.job and mod.job.asteroid or "?"),
-        now - (mod.runStartedAt or now)))
+        now - (mod.runStartedAt or now))
       mod.nextHeartbeatAt = now + RUN_HEARTBEAT_INTERVAL
     end
     return
@@ -893,22 +875,22 @@ local function stepRunning(mod)
   end
   mod.inactiveStreak = (mod.inactiveStreak or 0) + 1
   if mod.inactiveStreak == 1 or (now - (mod.lastRunWarnAt or 0) >= RUN_WARN_COOLDOWN) then
-    logger:warn(string.format(
+    logger:warn(
       "[HEALTH] M%d inactive while RUNNING (streak=%d/%d, asteroid=%s)",
       mod.index,
       mod.inactiveStreak,
       RUN_INACTIVE_CONFIRM,
-      tostring(mod.job and mod.job.asteroid or "?")))
+      tostring(mod.job and mod.job.asteroid or "?"))
     mod.lastRunWarnAt = now
   end
   if mod.inactiveStreak < RUN_INACTIVE_CONFIRM then
     return
   end
 
-  logger:warn(string.format(
+  logger:warn(
     "[HEALTH] M%d marking DONE after %.1fs inactive confirmation",
     mod.index,
-    now - (mod.inactiveSinceAt or now)))
+    now - (mod.inactiveSinceAt or now))
   local observed = now - (mod.runStartedAt or now)
   cycleStats.runTime = cycleStats.runTime + observed
   mod.cycRun = observed
@@ -932,7 +914,15 @@ local function stepRunning(mod)
   end
 
   mod.status = "DONE"
-  mod.adapter.setWorkAllowed(false)
+  -- Failing to close the gate is worth an ERROR, not a shrug: the module would
+  -- otherwise keep cycling on whatever is left in its bus while the broker
+  -- believes it has stopped.
+  local okGate, gateErr = pcall(function() mod.adapter.setWorkAllowed(false) end)
+  if not okGate then
+    mod.status = "ERROR"
+    mod.lastError = "setWorkAllowed(false): " .. tostring(gateErr)
+    logger:error("[HEALTH] M" .. mod.index .. " could not stop: " .. tostring(gateErr))
+  end
 end
 
 local function stepDone(mod)
@@ -957,10 +947,16 @@ local function stepDone(mod)
       } or nil
       mod.heldSince = computer.uptime()
     else
-      returnItemsToME(mod)
+      -- Each guarded separately so one failure does not skip the rest. A module
+      -- left with its gate open is the worst of the three outcomes, so it must
+      -- not be reachable by a transposer throwing on the line above it.
+      local okRet, retErr = pcall(returnItemsToME, mod)
+      if not okRet then
+        logger:warn("[DONE] M" .. mod.index .. " item return failed: " .. tostring(retErr))
+      end
     end
-    clearInterfaceSlots(mod)
-    mod.adapter.setWorkAllowed(false)
+    pcall(clearInterfaceSlots, mod)
+    pcall(function() mod.adapter.setWorkAllowed(false) end)
   elseif computer.uptime() - mod.doneTime >= DONE_SETTLE then
     if mod.job and brokerState.jobs[mod.job.jobId] then
       brokerState.jobs[mod.job.jobId] = nil
@@ -976,8 +972,8 @@ local function stepDone(mod)
       refills = mod.refills or 0,
     })
     mod.idleSince = computer.uptime()
-    logger:info(string.format("[CYCLE] M%d done (%d total, duty %.0f%%)",
-      mod.index, cycleStats.cycles, statsDuty()))
+    logger:info("[CYCLE] M%d done (%d total, duty %.0f%%)",
+      mod.index, cycleStats.cycles, statsDuty())
     mod.job = nil
     mod.status = "IDLE"
     mod.doneTime = nil
@@ -987,7 +983,7 @@ local function stepDone(mod)
     mod.inactiveSinceAt = nil
     mod.nextHeartbeatAt = 0
     mod.lastRunWarnAt = 0
-    lastDispatchCheck = computer.uptime() - DISPATCH_INTERVAL
+    lastDispatchCheck = computer.uptime() - config.dispatchInterval
   end
 end
 
@@ -1000,8 +996,8 @@ end
 local function releaseStaleHold(mod)
   if not mod.holding or mod.status ~= "IDLE" then return end
   if computer.uptime() - (mod.heldSince or 0) < (config.holdTimeout or 10) then return end
-  logger:info(string.format("[HOLD] M%d released after %.0fs unclaimed",
-    mod.index, computer.uptime() - (mod.heldSince or 0)))
+  logger:info("[HOLD] M%d released after %.0fs unclaimed",
+    mod.index, computer.uptime() - (mod.heldSince or 0))
   pcall(returnItemsToME, mod)
   mod.holding, mod.heldSince = nil, nil
 end
@@ -1071,18 +1067,30 @@ local function getIdleModules()
   local idle = {}
   local now = computer.uptime()
   for i, mod in ipairs(modules) do
-    if mod.status == "IDLE" then
-      idle[#idle + 1] = mod
-    elseif mod.status == "ERROR" then
-      if not lastErrorTime[i] then
-        lastErrorTime[i] = now
-      elseif now - lastErrorTime[i] >= ERROR_TIMEOUT then
-        pcall(function() mod.adapter.setWorkAllowed(false) end)
-        pcall(function() returnItemsToME(mod) end)
-        mod.status = "IDLE"; mod.job = nil; mod.doneTime = nil
-        lastErrorTime[i] = nil
-        logger:info("[RECOVERY] M" .. i .. " auto-recovered from ERROR state")
+    -- A module with no dialect is never dispatchable: the load would run in
+    -- full and only then discover there is no way to tell the module where to
+    -- mine. Leave it out of dispatch entirely, including out of the ERROR
+    -- recovery below, which would otherwise hand it a job every ERROR_TIMEOUT
+    -- seconds forever.
+    --
+    -- There used to be a re-probe here, for an adapter caught mid chunk-reload
+    -- at boot. The dialect comes from the gtVersion setting now, not from the
+    -- hardware, so it is set for every module or for none and there is nothing
+    -- a retry could discover.
+    if mod.dialect then
+      if mod.status == "IDLE" then
         idle[#idle + 1] = mod
+      elseif mod.status == "ERROR" then
+        if not lastErrorTime[i] then
+          lastErrorTime[i] = now
+        elseif now - lastErrorTime[i] >= ERROR_TIMEOUT then
+          pcall(function() mod.adapter.setWorkAllowed(false) end)
+          pcall(function() returnItemsToME(mod) end)
+          mod.status = "IDLE"; mod.job = nil; mod.doneTime = nil
+          lastErrorTime[i] = nil
+          logger:info("[RECOVERY] M" .. i .. " auto-recovered from ERROR state")
+          idle[#idle + 1] = mod
+        end
       end
     end
   end
@@ -1129,13 +1137,21 @@ local function preferHolder(pool, droneKey)
   return nil
 end
 
-local function tryDispatch(mod, asteroid, droneKey)
+-- `avail` / `availKit` are the batch's working pools. They are REQUIRED, not
+-- optional: this used to gate on brokerState.drones -- the raw ME figure -- which
+-- meant the commitment point ignored reservations entirely and only worked
+-- because both callers happened to check the pool first. Passing them in makes
+-- the gate and the accounting the same numbers.
+local function tryDispatch(mod, asteroid, droneKey, avail, availKit)
   local asteroidData = config.asteroids[asteroid]
   if not asteroidData then return false end
   if not droneKey then return false end
 
   local droneTier = config.droneTierKeys[droneKey]
   if droneTier < asteroidData.minDrone or droneTier > asteroidData.maxDrone then return false end
+
+  local modTierNum = mod.tier == "MK-III" and 3 or (mod.tier == "MK-II" and 2 or 1)
+  if modTierNum < (asteroidData.minModule or 1) then return false end
 
   local drillKey = config.droneDrillMap[droneTier]
   if not drillKey then return false end
@@ -1154,13 +1170,30 @@ local function tryDispatch(mod, asteroid, droneKey)
   -- another set: the drone never left, and the loader only fetches whatever
   -- consumables it is actually short of.
   local holds = moduleHolds(mod, droneKey, drillKey)
-  if not holds and (brokerState.drones[droneKey] or 0) <= 0 then return false end
-
-  -- Don't dispatch if we don't have enough drill kits for a full load.
-  -- The loader needs config.tipsPerLoad tips + config.rodsPerLoad rods per module.
-  local drill = brokerState.drills[drillKey]
   local minKits = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
-  if not holds and (not drill or (drill.kits or 0) < minKits) then return false end
+
+  -- ONE GATE FOR DRONES, TWO FOR KITS, AND THE DIFFERENCE IS THE POINT.
+  --
+  -- There used to be a second drone gate on brokerState.drones -- the raw ME
+  -- figure -- asking "can this actually be FETCHED". It was there because the
+  -- pool was derived from telemetry and could disagree with it. The pool is the
+  -- declared fleet minus what modules are using now, so there is nothing left
+  -- for a second opinion to add: if the ledger says free and the network cannot
+  -- hand it over, the fleet has drifted from what you declared, and the loader
+  -- says so by name rather than this silently picking a weaker drone.
+  --
+  -- Kits keep both, because they ARE measured: enough unpromised, and enough
+  -- actually in the network.
+  --
+  -- A module that holds the hardware needs none of it: the drone never left it,
+  -- and the loader only fetches what it is short of.
+  if not holds then
+    if (avail[droneKey] or 0) <= 0 then return false end
+
+    if (availKit[drillKey] or 0) < minKits then return false end
+    local drill = brokerState.drills[drillKey]
+    if not drill or (drill.kits or 0) < minKits then return false end
+  end
 
   local jobId = nodeId .. "-" .. math.floor(computer.uptime() * 1000) .. "-M" .. mod.index
   mod.lastDispatchAt = computer.uptime()   -- fairness ordering, see dispatchBatch
@@ -1184,8 +1217,8 @@ local function tryDispatch(mod, asteroid, droneKey)
     pcall(returnItemsToME, mod)
   end
   if holds then
-    logger:info(string.format("[FASTLOAD] M%d keeping %s for %s (consumables fetched fresh)",
-      mod.index, tostring(config.drones[droneKey]), asteroid))
+    logger:info("[FASTLOAD] M%d keeping %s for %s (consumables fetched fresh)",
+      mod.index, tostring(config.drones[droneKey]), asteroid)
   end
   mod.holding, mod.heldSince = nil, nil
 
@@ -1211,34 +1244,85 @@ end
 -- genuinely free. It also imposed a standing tax of one spare drone per busy
 -- module just to keep dispatching.
 --
--- If the hw node goes quiet, lastHWSyncTime stops advancing and every
--- commitment counts again -- which is the conservative direction to fail in.
+-- KITS ONLY, now. Drones stopped asking this the moment the pool became
+-- "declared minus committed" -- there is no sweep in that sum to be ahead of.
+-- Tips and rods are consumed, so their figure really is measured and this
+-- question really does have to be answered.
 --
--- config.reserveWhileMining skips this question entirely: with it set, a busy
--- module is charged for its drone and kits however long ago telemetry saw them.
--- That reintroduces the standing tax described above on purpose, for setups
--- where the hw node's figures cannot be trusted to be current.
-local function telemetryHasSeen(mod)
+-- hw_telem scans and broadcasts once per loop around a 10s event.pull, so a
+-- figure older than this means the node has genuinely stopped reporting rather
+-- than merely being between sweeps.
+local HW_STALE = 30
+
+-- `trustStaleFigure` only relaxes the staleness bail-out below; an unseen
+-- commitment is charged either way. Default (no argument) is the careful answer,
+-- so a new call site has to opt IN to trusting a figure that stopped moving.
+local function telemetryHasSeen(mod, trustStaleFigure)
   local at = mod.job and mod.job.dispatchedAt
   if not at then return true end   -- pre-existing job from before this field
-  return at <= (brokerState.lastHWSyncTime or 0)
+  local sync = brokerState.lastHWSyncTime or 0
+  -- A STALE FIGURE IS NOT EVIDENCE, whatever its timestamp says about the past.
+  -- If the node has gone quiet, sync stops advancing and every commitment older
+  -- than it would otherwise count as "already excluded from the stock figure" --
+  -- so the broker would keep dispatching against a number that will never move
+  -- again. Charging everything instead stops dispatch and self-corrects the
+  -- moment the node reports.
+  --
+  -- This used to be behind a reserveWhileMining setting. That is gone,
+  -- because its off position was identical to on whenever telemetry was healthy
+  -- and strictly worse whenever it was not -- which is not a preference.
+  if not trustStaleFigure and (computer.uptime() - sync) > HW_STALE then
+    return false
+  end
+  return at <= sync
 end
 
 -- How many of each drone are actually free to assign right now?
 --
--- strict charges every busy module, not just the ones telemetry has yet to see.
--- Callers pass config.reserveWhileMining for the dispatch pool, and false where
--- the question is which tiers this array OWNS rather than which are free.
-local function availableDrones(strict)
+-- DECLARED, MINUS WHAT IS COMMITTED. No telemetry, no timestamps, no windows.
+--
+-- This used to start from the ME figure and try to reconstruct reality from it:
+-- subtract commitments a sweep had not seen, add back what modules were holding,
+-- add back what was in flight to the network. Every one of those corrections
+-- existed because hw_telem can only see the NETWORK, and a drone in an input
+-- bus, an interface buffer, or mid-transfer is not in it. Four separate bugs
+-- came out of that seam -- a tier frozen at a stale count, a returned drone
+-- invisible for a sweep, a drone left in a bus invisible at boot, and a sweep
+-- timestamp that records arrival rather than when the scan ran.
+--
+-- config.droneStock is the fleet, stated by the operator. Everything else here
+-- is bookkeeping the broker does itself and therefore knows exactly.
+--
+-- Takes no arguments, and that is the tell: there is no "how much do we trust
+-- the sweep" question left to answer for drones. availableKits still has one,
+-- because tips and rods ARE consumed and their figure really is measured.
+local function availableDrones()
   local avail = {}
-  for key, count in pairs(brokerState.drones) do avail[key] = count end
+  for key, count in pairs(config.droneStock or {}) do
+    avail[key] = tonumber(count) or 0
+  end
+
   for _, mod in ipairs(modules) do
-    if mod.status ~= "IDLE" and mod.job and mod.job.droneKey
-       and (strict or not telemetryHasSeen(mod)) then
+    -- Anything not idle is using its drone, full stop. No exception for a
+    -- commitment the sweep has already accounted for, because there is no sweep
+    -- in this sum any more -- the double-charge that exception existed to
+    -- prevent cannot occur.
+    if mod.status ~= "IDLE" and mod.job and mod.job.droneKey then
       local k = mod.job.droneKey
       avail[k] = (avail[k] or 0) - 1
     end
+    -- NOTHING IS ADDED BACK FOR A HOLD, and that is not an omission. With
+    -- fastReload a finished module keeps its drone and goes IDLE with job = nil,
+    -- so the charge above skips it -- and it is already inside the declared
+    -- total, because it never stopped being ours. The old version had to credit
+    -- holds explicitly to undo the ME figure calling them missing; there is no
+    -- ME figure here to undo. preferHolder still hands it back to the same
+    -- module, which is a routing decision, not an accounting one.
   end
+
+  -- A fleet declared smaller than what is actually committed -- you dispatched
+  -- ten and then edited the setting down to eight -- must not read as negative.
+  for k, v in pairs(avail) do if v < 0 then avail[k] = 0 end end
   return avail
 end
 
@@ -1246,19 +1330,69 @@ end
 -- config.tipsPerLoad / rodsPerLoad, not one kit. Subtracting 1 under-counted an
 -- unseen commitment by that whole factor, which every other site in this file
 -- already charges in full.
-local function availableKits(strict)
+-- Same three changes as availableDrones, for the same reasons: charge only what
+-- the sweep has not seen, credit what a module is holding, and never return a
+-- negative.
+-- `trustStaleFigure` picks the view, and the two callers want opposite answers.
+-- Dispatch passes false: committing against a figure that stopped updating is
+-- how you over-promise a material. The dust panel's reachability check passes
+-- true, because its question is "can this array ever mine that" -- and a hw node
+-- that died five minutes ago is no reason to report every asteroid as beyond us.
+local function availableKits(trustStaleFigure)
   local perLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
   local avail = {}
   for key, d in pairs(brokerState.drills) do avail[key] = (d and d.kits) or 0 end
   for _, mod in ipairs(modules) do
     if mod.status ~= "IDLE" and mod.job and mod.job.drillKey
-       and (strict or not telemetryHasSeen(mod)) then
+       and not telemetryHasSeen(mod, trustStaleFigure) then
       local k = mod.job.drillKey
       avail[k] = (avail[k] or 0) - perLoad
     end
+    if config.fastReload and mod.holding and mod.holding.drillKey then
+      local k = mod.holding.drillKey
+      avail[k] = (avail[k] or 0) + perLoad
+    end
   end
+  for k, v in pairs(avail) do if v < 0 then avail[k] = 0 end end
   return avail
 end
+
+-- ---------------------------------------------------------------------------
+-- THE POOLS, FOR ANYONE WHO IS NOT DISPATCHING
+--
+-- The hardware panel wants the same numbers dispatch uses, but it repaints on
+-- uiInterval (0.1s by default) and rebuilding both tables per frame would walk
+-- every module and every telemetry key ten times a second for a readout that
+-- only changes when something is dispatched or a sweep lands.
+--
+-- Cached against a stamp that moves on exactly those events, the way dustList
+-- caches against edGen. Dispatch itself never calls this: it needs tables it can
+-- decrement as it assigns, so it keeps building its own.
+--
+-- ONE TABLE RATHER THAN SIX LOCALS, because the main chunk is at Lua's 200-local
+-- ceiling and this file is the reason. See the K table near the editor.
+-- ---------------------------------------------------------------------------
+local POOL = { stamp = nil, drones = nil, kits = nil }
+
+function POOL.refresh()
+  local parts = { tostring(brokerState.lastHWSyncTime or 0) }
+  for _, mod in ipairs(modules) do
+    parts[#parts + 1] = mod.status ..
+      (mod.job and mod.job.droneKey or "-") ..
+      (mod.holding and mod.holding.droneKey or "-")
+  end
+  local stamp = table.concat(parts, "|")
+  if stamp ~= POOL.stamp then
+    POOL.stamp  = stamp
+    -- The panels report what dispatch will actually do, so they take the same
+    -- conservative kit view it does.
+    POOL.drones = availableDrones()
+    POOL.kits   = availableKits(false)
+  end
+end
+
+function POOL.freeDrones() POOL.refresh() return POOL.drones end
+function POOL.freeKits()   POOL.refresh() return POOL.kits   end
 
 -- Per-asteroid module cap: an asteroid may hold at most "half the modules plus
 -- one" at once, so a single high-tier target (e.g. Infinity Catalyst) can take a
@@ -1289,6 +1423,29 @@ local function activeAsteroidCounts()
     end
   end
   return counts
+end
+
+-- Is any telemetry node reporting that it has given up on its ME query?
+--
+-- Returns the node's label and the reason, or nil. Dispatch is held while this
+-- is set: every input to the decision -- what is low, what hardware is free,
+-- whether there is plasma -- comes from these three nodes, and acting on figures
+-- a node has disowned is how the fleet ends up mining a shortage that does not
+-- exist.
+local NODE_LABEL = {
+  DUST_UPDATE  = "DUST NODE",
+  FLUID_UPDATE = "FLUID NODE",
+  HW_UPDATE    = "HW NODE",
+}
+
+local function nodeFault()
+  -- Fixed order rather than pairs(), so the message does not change between
+  -- frames while two nodes are down.
+  for _, kind in ipairs({ "DUST_UPDATE", "FLUID_UPDATE", "HW_UPDATE" }) do
+    local why = brokerState.nodeError[kind]
+    if why then return NODE_LABEL[kind], why end
+  end
+  return nil
 end
 
 -- Mining modules physically require a plasma fluid to operate (any of the five
@@ -1322,7 +1479,7 @@ local function tryDispatchPinned(mod, avail, availKit, minKitsForLoad)
       if droneTier >= asteroidData.minDrone and droneTier <= asteroidData.maxDrone then
         local drillKey = config.droneDrillMap[droneTier]
         if drillKey and (availKit[drillKey] or 0) >= minKitsForLoad then
-          if tryDispatch(mod, asteroid, droneKey) then
+          if tryDispatch(mod, asteroid, droneKey, avail, availKit) then
             avail[droneKey]    = avail[droneKey] - 1
             availKit[drillKey] = availKit[drillKey] - minKitsForLoad
             return true
@@ -1381,47 +1538,28 @@ local function dispatchBatch()
   while #idleModules > slots do table.remove(idleModules) end
 
   -- Working pools we can still hand out this batch: drones and drill kits.
-  local strict         = config.reserveWhileMining or false
-  local avail          = availableDrones(strict)
-  local availKit       = availableKits(strict)
+  local avail          = availableDrones()
+  local availKit       = availableKits(false)
   local minKitsForLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
 
   -- A SECOND view, for reachability only.
   --
-  -- Reachability asks whether this array can ever serve a need at all -- a
-  -- question about which drone tiers we own, not which are free this instant.
-  -- Under reserveWhileMining the dispatch pool deliberately hides every busy
-  -- module's drone, and answering from it would report a merely busy fleet as
-  -- permanently unable to mine anything, filling the dust panel with "NO DRONE"
-  -- for asteroids we have perfectly good drones for.
+  -- Reachability asks whether this array can ever serve a need at all -- not
+  -- what is free this instant. Answering it from the dispatch pool would fill
+  -- the dust panel with "NO KITS" for materials we hold plenty of, whenever the
+  -- hw node happened to be quiet.
   --
-  -- With the option off these are the same tables, so nothing changes.
-  local reachAvail    = strict and availableDrones(false) or avail
-  local reachAvailKit = strict and availableKits(false)   or availKit
+  -- Drones need no second view: the declared fleet is what we own, and dispatch
+  -- reads the same table. This used to build a duplicate of it under
+  -- reserveWhileMining, which is a table per batch for no difference.
+  local reachAvail    = avail
+  local reachAvailKit = availableKits(true)
 
-  -- Count what idle modules are still holding as available, because it is: the
-  -- drone is sitting in that module and the loader will not ask the ME for
-  -- another. Without this the outer gates below see zero stock and refuse the
-  -- one dispatch that needs no stock at all.
-  --
-  -- tryDispatch still checks the real ME figures, so a phantom cannot be spent
-  -- by a DIFFERENT module -- it would fail there and the loop moves on.
-  if config.fastReload then
-    for _, m in ipairs(idleModules) do
-      local h = m.holding
-      if h then
-        avail[h.droneKey]    = (avail[h.droneKey] or 0) + 1
-        availKit[h.drillKey] = (availKit[h.drillKey] or 0) + minKitsForLoad
-        -- A held drone is owned as much as a stocked one, so reachability has to
-        -- see it too. Skipped when the tables are the same object, or the add
-        -- would land twice.
-        if reachAvail ~= avail then
-          reachAvail[h.droneKey]    = (reachAvail[h.droneKey] or 0) + 1
-          reachAvailKit[h.drillKey] = (reachAvailKit[h.drillKey] or 0) + minKitsForLoad
-        end
-      end
-    end
-  end
+  -- Held drones and kits used to be credited back here, over this function's
+  -- own copies. availableDrones/availableKits do it now, which fixes two things
+  -- this version could not: a hold on a module trimmed out of idleModules by the
+  -- concurrency cap was never counted, and nothing outside this function -- the
+  -- hardware panel especially -- could see a hold at all.
 
   -- Pinned modules always mine their assigned asteroid, ignoring dust thresholds
   -- and the per-asteroid cap. Handle them first and drop them from the pool so
@@ -1560,9 +1698,39 @@ local function dispatchBatch()
     if not asteroidData then return false end
     if (astCount[asteroidName] or 0) >= cap then return false end
 
+    -- WHY A BETTER DRONE WAS NOT USED.
+    --
+    -- assignOne walks the tiers high to low and takes the first one it can
+    -- place, which means a module ending up on a weak drone is the RESULT of
+    -- several silent refusals. Three of them are legitimate -- the asteroid caps
+    -- below that tier, its drill material is short, every one is already out --
+    -- and telling them apart from the outside is guesswork. Record the first
+    -- skip so the dispatch log can name it.
+    local skipped
+    local function note(key, why)
+      if not skipped then skipped = { model = config.droneModel(key), why = why } end
+    end
+
     for _, droneKey in ipairs(config.droneKeyOrder) do
+      local droneTier = config.droneTierKeys[droneKey]
+      -- Only worth explaining for a tier we actually own; the rest is noise.
+      if droneTier and (tonumber((config.droneStock or {})[droneKey]) or 0) > 0 then
+        if droneTier > asteroidData.maxDrone or droneTier < asteroidData.minDrone then
+          note(droneKey, string.format("%s takes tier %d-%d",
+            asteroidName, asteroidData.minDrone, asteroidData.maxDrone))
+        elseif (avail[droneKey] or 0) <= 0 then
+          note(droneKey, string.format("none free (%d owned, all committed)",
+            tonumber((config.droneStock or {})[droneKey]) or 0))
+        else
+          local dk = config.droneDrillMap[droneTier]
+          if dk and (availKit[dk] or 0) < minKitsForLoad then
+            note(droneKey, string.format("%s kits %d < %d",
+              dk, availKit[dk] or 0, minKitsForLoad))
+          end
+        end
+      end
+
       if (avail[droneKey] or 0) > 0 then
-        local droneTier = config.droneTierKeys[droneKey]
         if droneTier >= asteroidData.minDrone and droneTier <= asteroidData.maxDrone then
           local drillKey = config.droneDrillMap[droneTier]
           if drillKey and (availKit[drillKey] or 0) >= minKitsForLoad then
@@ -1576,11 +1744,16 @@ local function dispatchBatch()
             end
             for _, idx in ipairs(order) do
               local mod = pool[idx]
-              if mod and tryDispatch(mod, asteroidName, droneKey) then
+              if mod and tryDispatch(mod, asteroidName, droneKey, avail, availKit) then
                 astCount[asteroidName] = (astCount[asteroidName] or 0) + 1
                 avail[droneKey]        = avail[droneKey] - 1
                 availKit[drillKey]     = availKit[drillKey] - minKitsForLoad
                 table.remove(pool, idx)
+                if skipped then
+                  logger:info("[DISPATCH] M%d <- %s on %s; passed over %s: %s",
+                    mod.index, config.droneModel(droneKey), asteroidName,
+                    skipped.model, skipped.why)
+                end
                 return true
               end
             end
@@ -1624,6 +1797,54 @@ end
 -- TELEMETRY
 -- =============================================================================
 
+-- ---------------------------------------------------------------------------
+-- HARDWARE STOCK: REPLACE, DO NOT MERGE.
+--
+-- This was `for k, v in pairs(data.drones) do state.drones[k] = v end`, and the
+-- combination of that with a node that only sent non-zero counts meant A TIER
+-- THAT REACHED ZERO NEVER CAME BACK. Once the last LuV drone was committed, the
+-- node stopped mentioning luv, the merge had nothing to overwrite the old 7
+-- with, and the broker believed in seven drones that did not exist until it was
+-- restarted.
+--
+-- What that cost: tryDispatch's only guard against handing out a drone the
+-- network does not physically hold is `brokerState.drones[droneKey] <= 0`. With
+-- the count frozen high that guard never fires, so a surplus module was
+-- dispatched, waited out ARRIVE_TIMEOUT for a drone that was not there, failed
+-- to ERROR, recovered, and went round again forever.
+--
+-- hw_telem now sends its zeroes, which fixes this from the other end. Both
+-- halves are here on purpose: this one also covers an un-upgraded node, and
+-- that one covers an un-upgraded broker. Neither should have to trust the
+-- other to be current.
+--
+-- Keyed off the config lists rather than off the payload, so a node sending a
+-- key we do not know cannot inject it into a table dispatch reads.
+-- ---------------------------------------------------------------------------
+local function applyHwStock(state, data)
+  if type(data) ~= "table" then return end
+
+  if type(data.drones) == "table" then
+    for _, key in ipairs(config.droneKeyOrder) do
+      state.drones[key] = tonumber(data.drones[key]) or 0
+    end
+  end
+
+  if type(data.drills) == "table" then
+    for _, key in ipairs(drillKeyOrder) do
+      local d = data.drills[key]
+      -- An absent material is zero of it, not "no opinion". Written out rather
+      -- than left nil because every reader does (d and d.kits) or 0 and a nil
+      -- would work by accident -- until one of them stopped guarding.
+      state.drills[key] = (type(d) == "table")
+        and { kits = tonumber(d.kits) or 0,
+              tips = tonumber(d.tips) or 0,
+              rods = tonumber(d.rods) or 0 }
+        or  { kits = 0, tips = 0, rods = 0 }
+    end
+  end
+end
+
 -- Bumped whenever anything the editor DISPLAYS changes: the row list itself,
 -- what is tracked, a target, or the dust stock behind the HAVE column.
 --
@@ -1648,7 +1869,48 @@ local function processMessage(evType, _, _, _, _, rawMsg)
   if evType ~= "modem_message" then return end
   local ok, msg = pcall(serial.unserialize, rawMsg)
   if not ok or type(msg) ~= "table" then return end
-  if msg.protocol ~= "MEDINA_TELEMETRY" or not msg.data then return end
+  if msg.protocol ~= "MEDINA_TELEMETRY" then return end
+
+  -- A NODE REPORTING A FAULT, rather than reporting figures.
+  --
+  -- A telemetry node whose ME query keeps failing republishes its last good
+  -- figures for a few cycles and then stops publishing them at all, sending this
+  -- instead. Handled before the payload branches because there is no `data` on
+  -- one of these -- the whole point is that the node has nothing it stands
+  -- behind.
+  --
+  -- Keep the figures we already hold: they are stale, but they are the last ones
+  -- that were true, and overwriting them with zeroes is the failure this whole
+  -- mechanism exists to prevent. Dispatch is held instead (see the main loop),
+  -- so nothing acts on them while the fault stands.
+  --
+  -- The sync CLOCK still advances. The node is alive and talking; it is the ME
+  -- behind it that is broken, and letting the sync colour rot to red would say
+  -- the opposite.
+  if msg.error then
+    brokerState.nodeError[msg.payloadType] = tostring(msg.error)
+    if     msg.payloadType == "DUST_UPDATE"  then
+      brokerState.lastDustSyncTime  = computer.uptime()
+      brokerState.lastDustSync      = os.date("%X")
+    elseif msg.payloadType == "FLUID_UPDATE" then
+      brokerState.lastFluidSyncTime = computer.uptime()
+      brokerState.lastFluidSync     = os.date("%X")
+    elseif msg.payloadType == "HW_UPDATE"    then
+      brokerState.lastHWSyncTime    = computer.uptime()
+      brokerState.lastHWSync        = os.date("%X")
+    end
+    edTouch()
+    return
+  end
+
+  if not msg.data then return end
+
+  -- Figures arrived, so whatever fault this node was reporting is over.
+  -- `recast` means they are held over from an earlier scan rather than fresh;
+  -- the node is coping, and the panels say so, but they are real figures and
+  -- there is no reason to stop dispatching on them.
+  brokerState.nodeError[msg.payloadType]  = nil
+  brokerState.nodeRecast[msg.payloadType] = tonumber(msg.recast) or nil
 
   if msg.payloadType == "DUST_UPDATE" then
     -- Stock only. Thresholds are policy and policy lives here, in
@@ -1670,9 +1932,8 @@ local function processMessage(evType, _, _, _, _, rawMsg)
     brokerState.lastFluidSyncTime = computer.uptime()
     brokerState.lastFluidSync = os.date("%X")
   elseif msg.payloadType == "HW_UPDATE" then
-    if msg.data.drones then for k, v in pairs(msg.data.drones) do brokerState.drones[k] = v end end
-    if msg.data.drills then for k, v in pairs(msg.data.drills) do brokerState.drills[k] = v end end
-    -- Replaced wholesale, not merged like the two above. The node sends its
+    applyHwStock(brokerState, msg.data)
+    -- Replaced wholesale, like the stock tables above. The node sends its
     -- complete set of outstanding orders every cycle, so assignment is what
     -- lets a resolved entry clear itself -- merging would pin a "nopattern"
     -- warning on screen forever after you added the pattern.
@@ -1729,6 +1990,21 @@ end
 -- ---------------------------------------------------------------------------
 local dashCache, dashFG = {}, nil
 
+-- ROW KEYS ARE NUMBERS, NOT STRINGS.
+--
+-- Every row used to key the cache with SLOT_M + row / SLOT_D + row / SLOT_H + row,
+-- built fresh for that row on every frame -- roughly four hundred string
+-- allocations a second whose entire job was to index a table and be dropped.
+-- The three panels share y values on different parts of the screen, which is why
+-- the key has to say which panel; a per-panel numeric base says it just as well
+-- and allocates nothing.
+local SLOT_M, SLOT_D, SLOT_H = 0, 1000, 2000
+local SLOT_SYNC, SLOT_DTAG   = 9001, 9002
+-- The header buttons. Outside the three panel bands on purpose: they sit above
+-- the panels, so dashInvalidateRows -- which only drops the panel slots for the
+-- rows the quiesce box covers -- must not touch them.
+local SLOT_BTN_E, SLOT_BTN_P, SLOT_BTN_S = 9003, 9004, 9005
+
 -- Counts rows actually repainted. The quiesce box needs to know whether the
 -- panels have drawn over it, and "did anything paint" is cheaper to answer than
 -- tracking which rows.
@@ -1746,9 +2022,9 @@ local function dashInvalidate() dashCache, dashFG = {}, nil end
 -- was supposed to be noticing the next keypress.
 local function dashInvalidateRows(y1, y2)
   for y = y1, y2 do
-    dashCache["M" .. y] = nil
-    dashCache["D" .. y] = nil
-    dashCache["H" .. y] = nil
+    dashCache[SLOT_M + y] = nil
+    dashCache[SLOT_D + y] = nil
+    dashCache[SLOT_H + y] = nil
   end
 end
 
@@ -1758,21 +2034,65 @@ end
 
 -- Write one row of a panel, clearing its column strip first. Indentation is
 -- baked into `text` so every row of a panel starts at the same x.
+-- CACHE THE INPUTS, NOT A RENDERED KEY.
+--
+-- This used to build `tostring(color) .. "|" .. text` on every call, for every
+-- row, whether or not anything had changed -- two allocations per row per frame
+-- purely to ask "is this the same as last time?". Across three panels at
+-- uiInterval that was several hundred strings a second whose only purpose was to
+-- be compared and dropped.
+--
+-- Comparing the two values directly costs nothing: Lua interns string literals,
+-- so the constant rows (which are most of them) compare by pointer.
+--
+-- The cache entry is a table that is REUSED rather than replaced, so a settled
+-- dashboard allocates nothing at all.
+-- Three writers share one cache, so each one stamps EVERY field. Leaving a stale
+-- field behind is not cosmetic: a slot blanked and then written would keep
+-- `blank = true`, and the next dashBlank would skip a row that currently holds
+-- text. Writing all of them costs nothing -- the entry table is reused.
+local function dashStamp(e, kind, text, color, fmt, a, b, c, d)
+  e.kind, e.text, e.color, e.fmt = kind, text, color, fmt
+  e.a, e.b, e.c, e.d = a, b, c, d
+end
+
 local function dashRow(slot, x, width, y, text, color)
-  local key = tostring(color) .. "|" .. text
-  if dashCache[slot] == key then return end
-  dashCache[slot] = key
+  local e = dashCache[slot]
+  if e and e.kind == "t" and e.text == text and e.color == color then return end
+  if not e then e = {}; dashCache[slot] = e end
+  dashStamp(e, "t", text, color)
   dashPaints = dashPaints + 1
   gpu.fill(x, y, width, 1, " ")
   dashSetFG(color)
   gpu.set(x, y, text)
 end
 
+-- The same, for rows whose text has to be BUILT. The format string and its
+-- arguments are compared instead of the result, so string.format runs only when
+-- the row has actually changed -- the caller no longer pays to render a row the
+-- cache is about to discard.
+--
+-- Four argument slots covers every row in this file, and every call site is in
+-- the three panels below.
+local function dashRowF(slot, x, width, y, color, fmt, a, b, c, d)
+  local e = dashCache[slot]
+  if e and e.kind == "f" and e.color == color and e.fmt == fmt
+     and e.a == a and e.b == b and e.c == c and e.d == d then return end
+  if not e then e = {}; dashCache[slot] = e end
+  dashStamp(e, "f", nil, color, fmt, a, b, c, d)
+  dashPaints = dashPaints + 1
+  gpu.fill(x, y, width, 1, " ")
+  dashSetFG(color)
+  gpu.set(x, y, string.format(fmt, a, b, c, d))
+end
+
 -- Blank a row: spacers between sections, and the tail wipe under a panel that
 -- shrank. Cached too, so a settled layout stops paying for its blank rows.
 local function dashBlank(slot, x, width, y)
-  if dashCache[slot] == "" then return end
-  dashCache[slot] = ""
+  local e = dashCache[slot]
+  if e and e.kind == "b" then return end
+  if not e then e = {}; dashCache[slot] = e end
+  dashStamp(e, "b")
   dashPaints = dashPaints + 1
   gpu.fill(x, y, width, 1, " ")
 end
@@ -1786,50 +2106,54 @@ local function drawModulePanel()
     -- Pinned/reserved modules get a "*" marker so it's clear at a glance which
     -- ones are locked to a single asteroid. Same width as the normal "  " prefix.
     local pin = mod.pinnedAsteroid and " *" or "  "
-    local text, color
+    -- The format and its arguments are chosen here and rendered by dashRowF
+    -- only if the row actually changed. A module sitting in RUNNING repaints
+    -- nothing between asteroid changes, and now formats nothing either.
+    local fmt, a, b, c, d, color
     if mod.status == "RUNNING" then
       color = 0xFFAA00
-      text = string.format("%sM%d [%-5s]  %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or "?")
+      fmt, a, b, c, d = "%sM%d [%-5s]  %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or "?"
     elseif mod.status == "LOADING" then
       color = 0xFFFF00
-      text = string.format("%sM%d [%-5s]  LOADING %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or "")
+      fmt, a, b, c, d = "%sM%d [%-5s]  LOADING %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or ""
     elseif mod.status == "ERROR" then
       color = 0xFF4444
+      -- Still built eagerly: only an errored module pays it, and only while the
+      -- error stands.
       local errMsg = mod.lastError and (" " .. mod.lastError:sub(1, PW - 20)) or ""
-      text = string.format("%sM%d [%-5s]  ERROR%s", pin, mod.index, mod.tier, errMsg)
+      fmt, a, b, c, d = "%sM%d [%-5s]  ERROR%s", pin, mod.index, mod.tier, errMsg
     else
       color = 0x555555
       if mod.pinnedAsteroid then
-        text = string.format("%sM%d [%-5s]  IDLE (pin: %s)", pin, mod.index, mod.tier, mod.pinnedAsteroid)
+        fmt, a, b, c, d = "%sM%d [%-5s]  IDLE (pin: %s)", pin, mod.index, mod.tier, mod.pinnedAsteroid
       else
-        text = string.format("%sM%d [%-5s]  IDLE", pin, mod.index, mod.tier)
+        fmt, a, b, c = "%sM%d [%-5s]  IDLE", pin, mod.index, mod.tier
+        d = nil
       end
     end
-    dashRow("M" .. row, P1 + 1, PW, row, text, color)
+    dashRowF(SLOT_M + row, P1 + 1, PW, row, color, fmt, a, b, c, d)
     row = row + 1
 
     if (mod.status == "RUNNING") and mod.job and row <= H then
-      local droneName = config.drones[mod.job.droneKey] or "?"
-      local lvl = droneName:match("MK%-(.+)") or "?"
-      dashRow("M" .. row, P1 + 1, PW, row,
-        string.format("  dist=%d  drone=MK-%s  refills=%d",
-          mod.job.distance or 0, lvl, mod.refills or 0), 0xCCCCCC)
+      dashRowF(SLOT_M + row, P1 + 1, PW, row, 0xCCCCCC,
+        "  dist=%d  drone=%s  refills=%d",
+        mod.job.distance or 0, config.droneModel(mod.job.droneKey), mod.refills or 0)
       row = row + 1
 
       -- Load diagnostic from the most recent load of this module:
       -- "loaded 0.4s  db:1 buf:3" -- time taken + read-back poll counts.
       if mod.lastLoad and row <= H then
-        dashRow("M" .. row, P1 + 1, PW, row, "  " .. mod.lastLoad, 0x668866)
+        dashRowF(SLOT_M + row, P1 + 1, PW, row, 0x668866, "  %s", mod.lastLoad)
         row = row + 1
       end
 
       -- Blank spacer line before the next module, per layout.
       if row <= H then
-        dashBlank("M" .. row, P1 + 1, PW, row); row = row + 1
+        dashBlank(SLOT_M + row, P1 + 1, PW, row); row = row + 1
       end
     end
   end
-  for r = row, H do dashBlank("M" .. r, P1 + 1, PW, r) end
+  for r = row, H do dashBlank(SLOT_M + r, P1 + 1, PW, r) end
 end
 
 -- The sorted dust list, rebuilt only when the underlying stock actually changes.
@@ -1874,14 +2198,29 @@ local function drawDustPanel()
   -- Range indicator in the panel header, so a truncated list is obvious rather
   -- than looking like the whole list. Painted into a fixed-width region so a
   -- shorter tag cannot leave the tail of a longer one behind it.
+  --
+  -- A dust-node fault takes the slot instead. Every percentage in this panel is
+  -- derived from what that node reports, so when it has stopped reporting, the
+  -- state of the list matters far less than the fact that none of it is current.
+  local dustFault  = brokerState.nodeError["DUST_UPDATE"]
+  local dustRecast = brokerState.nodeRecast["DUST_UPDATE"]
   if #list > 0 then
-    local tag = string.format("%d-%d/%d",
-      math.min(dustScroll + 1, #list), math.min(dustScroll + capacity, #list), #list)
-    if maxScroll > 0 then tag = tag .. " ^v" end
-    local tw = 16
+    local tag, color
+    if dustFault then
+      tag, color = "STALE - NODE DOWN", 0xFF4444
+    elseif dustRecast then
+      tag, color = "held " .. dustRecast .. " scan(s)", 0xFFAA00
+    else
+      tag = string.format("%d-%d/%d",
+        math.min(dustScroll + 1, #list), math.min(dustScroll + capacity, #list), #list)
+      if maxScroll > 0 then tag = tag .. " ^v" end
+      color = maxScroll > 0 and 0xFFAA00 or 0x888888
+    end
+    local tw = 18
     local tx = math.max(P2 + 1, P3 - tw - 1)
-    dashRow("DTAG", tx, tw, 4, string.format("%" .. tw .. "s", tag),
-      maxScroll > 0 and 0xFFAA00 or 0x888888)
+    -- "%18s", literally: the old code rebuilt that format string from `tw` on
+    -- every frame. Keep the two in step if tw changes.
+    dashRow(SLOT_DTAG, tx, tw, 4, string.format("%18s", tag), color)
   end
 
   for i = dustScroll + 1, #list do
@@ -1898,8 +2237,8 @@ local function drawDustPanel()
         or (item.ratio >= 1.0) and 0x446644 or (item.ratio < 0.25) and 0xFF4444
         or (item.ratio < 0.75) and 0xFFAA00 or 0x00FFFF
     local mark = stuckOn and "x" or (item.ratio < 1.0 and "!" or " ")
-    dashRow("D" .. row, P2 + 1, PW, row,
-      string.format("  %s %-27s %3d%%", mark, item.name, pct), color)
+    dashRowF(SLOT_D + row, P2 + 1, PW, row, color,
+      "  %s %-27s %3d%%", mark, item.name, pct)
     row = row + 1
     if row > H then break end
     local detail
@@ -1918,10 +2257,10 @@ local function drawDustPanel()
     else
       detail = string.format("      %s / %s", formatQty(item.stock), formatQty(item.threshold))
     end
-    dashRow("D" .. row, P2 + 1, PW, row, detail, stuckOn and 0xFF00FF or 0x666666)
+    dashRow(SLOT_D + row, P2 + 1, PW, row, detail, stuckOn and 0xFF00FF or 0x666666)
     row = row + 1
   end
-  for r = row, H do dashBlank("D" .. r, P2 + 1, PW, r) end
+  for r = row, H do dashBlank(SLOT_D + r, P2 + 1, PW, r) end
 end
 
 -- Restock entries, ranked and cached against hwGen.
@@ -1963,7 +2302,15 @@ end
 local function drawHWPanel()
   local row = 6
   local function put(text, color)
-    if row <= H then dashRow("H" .. row, P3 + 1, PW, row, text, color) end
+    if row <= H then dashRow(SLOT_H + row, P3 + 1, PW, row, text, color) end
+    row = row + 1
+  end
+
+  -- Same, but the row text is built only if the row changed. Use this wherever
+  -- put() would have been handed a string.format or a concatenation; `put` is
+  -- for constants, which Lua interns and which therefore cost nothing.
+  local function putf(color, fmt, a, b, c, d)
+    if row <= H then dashRowF(SLOT_H + row, P3 + 1, PW, row, color, fmt, a, b, c, d) end
     row = row + 1
   end
 
@@ -1977,33 +2324,40 @@ local function drawHWPanel()
   -- wipe below only reaches rows underneath the cursor, never these.
   local function skip(n)
     for _ = 1, (n or 1) do
-      if row <= H then dashBlank("H" .. row, P3 + 1, PW, row) end
+      if row <= H then dashBlank(SLOT_H + row, P3 + 1, PW, row) end
       row = row + 1
     end
   end
 
   if brokerState.nextTarget then
-    put("  NEXT: " .. brokerState.nextTarget.asteroid, 0xFFAA00)
+    putf(0xFFAA00, "  NEXT: %s", brokerState.nextTarget.asteroid)
   else
     put("  NEXT: (idle)", 0x666666)
   end
 
   -- Show the cap dispatch actually used, not a fresh guess: it depends on how
   -- many asteroids are currently wanted, which this panel does not recompute.
-  put("  PRIORITY: " .. brokerState.priorityMode:upper() ..
-      "   CAP: " .. (brokerState.cap or asteroidCap(0)) .. "/asteroid", 0x666666)
+  putf(0x666666, "  PRIORITY: %s   CAP: %s/asteroid",
+       brokerState.priorityMode:upper(), brokerState.cap or asteroidCap(0))
 
   put("  TELEMETRY SYNC:", 0x666666)
-  put("  Dust:   " .. brokerState.lastDustSync,  getSyncColor(brokerState.lastDustSyncTime))
-  put("  Fluid:  " .. brokerState.lastFluidSync, getSyncColor(brokerState.lastFluidSyncTime))
-  put("  HW:     " .. brokerState.lastHWSync,    getSyncColor(brokerState.lastHWSyncTime))
+  putf(getSyncColor(brokerState.lastDustSyncTime),  "  Dust:   %s", brokerState.lastDustSync)
+  putf(getSyncColor(brokerState.lastFluidSyncTime), "  Fluid:  %s", brokerState.lastFluidSync)
+  putf(getSyncColor(brokerState.lastHWSyncTime),    "  HW:     %s", brokerState.lastHWSync)
   -- Outbound par. Grey dashes here mean this broker has never sent DRILL_PAR --
   -- almost always an older broker-mk3.lua, since the send is unconditional.
-  put("  PAR TX: " .. brokerState.lastParSend .. " (" .. brokerState.lastParCount .. ")",
-      brokerState.lastParCount > 0 and 0x00FF00 or 0x555555)
+  -- An explicit "off" rather than a grey zero. Restock disabled and restock
+  -- broken look identical on a count alone, and the grey dashes here already
+  -- mean a third thing (never sent). Say which one it is.
+  if config.drillRestock == false then
+    putf(0x888888, "  PAR TX: %s  (auto-craft OFF)", brokerState.lastParSend)
+  else
+    putf(brokerState.lastParCount > 0 and 0x00FF00 or 0x555555,
+         "  PAR TX: %s (%s)", brokerState.lastParSend, brokerState.lastParCount)
+  end
   skip(1)
 
-  put("  TASKS RUNNING: " .. sched.count(), 0x888888)
+  putf(0x888888, "  TASKS RUNNING: %s", sched.count())
   -- Where module time actually goes. Duty is the share spent mining rather than
   -- loading, returning or waiting for a job -- the number to compare between
   -- runs when output feels off.
@@ -2013,30 +2367,29 @@ local function drawHWPanel()
     -- how the run has gone, recent says how it is going, and reading one as the
     -- other has produced a wrong conclusion here more than once.
     local r = recentStats()
-    put(string.format("  CYCLES: %d   DUTY: %.0f%%%s", cycleStats.cycles, duty,
-        r and string.format("   last%d %.0f%%", r.n, r.duty) or ""),
-        duty >= 80 and 0x00FF00 or duty >= 60 and 0xFFAA00 or 0xFF4444)
+    putf(duty >= 80 and 0x00FF00 or duty >= 60 and 0xFFAA00 or 0xFF4444,
+         "  CYCLES: %d   DUTY: %.0f%%%s", cycleStats.cycles, duty,
+         r and string.format("   last%d %.0f%%", r.n, r.duty) or "")
     -- Divided by LOADS, not cycles. Dividing load seconds by completed cycles
     -- counted the loads of modules still running against cycles that had
     -- finished, and reported roughly double the real figure -- visibly at odds
     -- with the per-module times on the left of the screen.
     if cycleStats.loads > 0 then
-      put(string.format("  LOAD avg %.1fs%s  max %.1fs  (%d)",
-          cycleStats.loadTime / cycleStats.loads,
-          r and string.format("  last%d %.1fs", r.n, r.load) or "",
-          cycleStats.loadMax, cycleStats.loads), 0x668866)
+      putf(0x668866, "  LOAD avg %.1fs%s  max %.1fs  (%d)",
+           cycleStats.loadTime / cycleStats.loads,
+           r and string.format("  last%d %.1fs", r.n, r.load) or "",
+           cycleStats.loadMax, cycleStats.loads)
     end
-    put(string.format("  REFILLS: %d   %.1f/cycle%s",
-        cycleStats.refills or 0, (cycleStats.refills or 0) / cycleStats.cycles,
-        r and string.format("   last%d %.1f", r.n, r.refills) or ""),
-        0x668866)
+    putf(0x668866, "  REFILLS: %d   %.1f/cycle%s",
+         cycleStats.refills or 0, (cycleStats.refills or 0) / cycleStats.cycles,
+         r and string.format("   last%d %.1f", r.n, r.refills) or "")
     if (cycleStats.spins or 0) > 0 then
-      put(string.format("  SPINUP avg %.1fs  max %.1fs",
-          cycleStats.spinTime / cycleStats.spins, cycleStats.spinMax), 0x668866)
+      putf(0x668866, "  SPINUP avg %.1fs  max %.1fs",
+           cycleStats.spinTime / cycleStats.spins, cycleStats.spinMax)
     end
-    put(string.format("  WAIT idle %.1fs/cyc  return %.1fs/cyc",
-        cycleStats.idleTime / cycleStats.cycles,
-        cycleStats.doneTime / cycleStats.cycles), 0x666666)
+    putf(0x666666, "  WAIT idle %.1fs/cyc  return %.1fs/cyc",
+         cycleStats.idleTime / cycleStats.cycles,
+         cycleStats.doneTime / cycleStats.cycles)
   else
     put("  CYCLES: none completed yet", 0x555555)
   end
@@ -2047,8 +2400,8 @@ local function drawHWPanel()
   -- stalls mid-recipe; "5m" is what it sustains while mining -- idle intervals
   -- are excluded, see computationSample.
   local cNow, cAvg, cPeak = computationStats()
-  put(string.format("  COMP/s now %s   5m %s   pk %s",
-      fmtComp(cNow), cAvg and fmtComp(cAvg) or "--", fmtComp(cPeak)), 0x668866)
+  putf(0x668866, "  COMP/s now %s   5m %s   pk %s",
+       fmtComp(cNow), cAvg and fmtComp(cAvg) or "--", fmtComp(cPeak))
   skip(1)
 
   -- Plasma stock (required to mine -- a module won't run without a plasma fluid).
@@ -2058,56 +2411,121 @@ local function drawHWPanel()
     local amt = brokerState.plasma[name] or 0
     if row > H then break end
     local short = name:gsub(" Plasma", "")
-    put(string.format("  %-16s %8d mB", short, amt), amt > 0 and 0xFF00FF or 0x555555)
+    putf(amt > 0 and 0xFF00FF or 0x555555, "  %-16s %8d mB", short, amt)
     if amt > 0 then anyPlasma = true end
   end
-  -- This row holds the waiting/blocked line only while plasma is absent, and the
-  -- row after it is a spacer. The rest of this panel gets away with
-  -- clear-as-you-write because every row is written every frame; this one is
-  -- not. On the frame plasma first appears the branch below stops running, so
-  -- whatever it wrote last frame would never be wiped -- which is how
-  -- "[ waiting for fluid telemetry... ]" survived on screen long after fluid
-  -- telemetry was green. Writing or blanking it unconditionally settles that.
-  if not anyPlasma then
+  -- TELEMETRY STATUS, in the two rows under the plasma list.
+  --
+  -- These rows are the exception to this panel's clear-as-you-write habit: the
+  -- rest of it writes every row on every frame, while what goes here depends on
+  -- state. When it was written conditionally, the frame where plasma first
+  -- appeared simply stopped running the branch and whatever it had written was
+  -- never wiped -- which is how "[ waiting for fluid telemetry... ]" survived on
+  -- screen long after fluid telemetry had gone green. Every branch below writes
+  -- both rows, blanking rather than skipping, which settles that.
+  --
+  -- ALWAYS EXACTLY TWO ROWS, whichever branch runs. The sections below this one
+  -- are laid out by a running cursor, so a block that is sometimes one row and
+  -- sometimes two shifts everything under it between frames -- which repaints
+  -- the whole panel and makes the drone and drill lists jump.
+  --
+  -- A node fault is checked FIRST, and that ordering is the point of it. When
+  -- the fluid node's ME query fails it stops publishing volumes, so every tier
+  -- reads zero here -- and "NO PLASMA - MINING BLOCKED" is then a confident
+  -- statement of something the broker does not know. It sent people to look at
+  -- an empty tank farm that was full. Name the node and the reason instead.
+  local faultNode, faultWhy = nodeFault()
+  local held = brokerState.nodeRecast["FLUID_UPDATE"] or brokerState.nodeRecast["DUST_UPDATE"]
+  if faultNode then
+    putf(0xFF4444, "  [ %s: %s ]", faultNode, faultWhy:sub(1, PW - 14))
+    put("  [ DISPATCH HELD until telemetry is trustworthy ]", 0xFF4444)
+  elseif not anyPlasma then
     if brokerState.lastFluidSyncTime == 0 then
       put("  [ waiting for fluid telemetry... ]", 0xFFAA00)
     else
       put("  [ NO PLASMA - MINING BLOCKED ]", 0xFF4444)
     end
+    put("", 0x555555)
+  elseif held then
+    -- Not a fault: a node hit a bad scan and is republishing its last good
+    -- figures while it recovers. Worth saying, because the numbers above are
+    -- older than the sync clock suggests -- but dispatch carries on.
+    putf(0xFFAA00, "  [ telemetry held over %s scan(s) - node coping ]", held)
+    put("", 0x555555)
+  else
+    put("", 0x555555)
+    put("", 0x555555)
   end
-  -- Unconditional, and it doubles as the wipe for the line above: when plasma
-  -- appears the branch stops running, and without this the last thing it wrote
-  -- would sit there forever.
   skip(1)
 
-  put("  DRONES IN STOCK:", 0x888888)
-  local any = false
+  -- STOCK AND FREE ARE DIFFERENT NUMBERS, AND THIS PANEL USED TO SHOW ONLY ONE.
+  --
+  -- Stock is what the ME held at the last hw sweep, which is up to a scan
+  -- interval old and never subtracts a thing. Free is what dispatch can actually
+  -- hand out. Reading the first as the second is what made a busy UHV look like
+  -- an idle one -- the drone was already in a module and the figure had simply
+  -- not caught up.
+  --
+  -- Both are shown, and only when they disagree, so the ordinary case stays a
+  -- single number. `x0 (1 free)` is a drone held by a finished module under
+  -- DECLARED, FREE, AND WHAT THE NETWORK CAN ACTUALLY SEE.
+  --
+  -- The first two are the ledger: config.droneStock minus what modules are
+  -- using. The third is telemetry, and it is here as an AUDIT rather than as an
+  -- input -- it can only see the ME network, so a drone in a bus reads as
+  -- missing and the two legitimately differ while modules are running.
+  --
+  -- What it catches is drift: declare ten, own nine, and every cycle one load
+  -- fails for a drone that is not there. Without this line that reads as a
+  -- hardware fault. With it, the fleet says so.
+  local freeDrones = POOL.freeDrones()
+  put("  DRONES (declared):", 0x888888)
+  local any, declaredTotal, seenTotal = false, 0, 0
   for _, key in ipairs(config.droneKeyOrder) do
-    local count = brokerState.drones[key] or 0
-    if count > 0 then
+    local owned = tonumber((config.droneStock or {})[key]) or 0
+    local free  = freeDrones[key] or 0
+    declaredTotal = declaredTotal + owned
+    seenTotal = seenTotal + (brokerState.drones[key] or 0)
+    if owned > 0 then
       if row > H then break end
-      local droneName = config.drones[key] or ("Drone-" .. key)
-      local lvl = droneName:match("MK%-(.+)") or "?"
-      put(string.format("  %-18s  x%d", "MK-" .. lvl, count), 0x00FFFF)
+      -- Amber when nothing is free: the tier is owned but every one of them is
+      -- out, which is a different state from not owning one at all.
+      local color = (free > 0) and 0x00FFFF or 0xFFAA00
+      putf(color, "  %-18s  %d owned  %d free", config.droneModel(key), owned, free)
       any = true
     end
   end
-  if not any then put("  [ NO DRONES IN STOCK ]", 0xFF4444) end
+  if not any then
+    put("  [ NO DRONES DECLARED ]", 0xFF4444)
+    -- Telemetry cannot set this, but it is exactly the right thing to suggest
+    -- it: a fresh install otherwise dispatches nothing and says nothing about
+    -- why.
+    if seenTotal > 0 then
+      putf(0xFFAA00, "  network sees %d -- set them on the HARDWARE page (%s)",
+           seenTotal, config.hotkeyEditor and "E" or "SETTINGS")
+    end
+  end
 
   skip(1)
 
   -- Drill kits (a "kit" = one drill tip + one rod of the same material).
+  local freeKits = POOL.freeKits()
   put("  DRILL KITS IN STOCK:", 0x888888)
   local anyDrill = false
   for _, key in ipairs(drillKeyOrder) do
     local d = brokerState.drills[key]
     local kits = (d and d.kits) or 0
-    if kits > 0 then
+    local free = freeKits[key] or 0
+    if kits > 0 or free > 0 then
       if row > H then break end
       -- Display the material name, stripped of " Drill Tip".
       local entry = config.drills[key]
       local name = (entry and entry.tip and entry.tip:gsub(" Drill Tip", "")) or key
-      put(string.format("  %-18s  x%d", name, kits), 0x00AAFF)
+      if free ~= kits then
+        putf(0x00AAFF, "  %-18s  x%d  (%d free)", name, kits, free)
+      else
+        putf(0x00AAFF, "  %-18s  x%d", name, kits)
+      end
       anyDrill = true
     end
   end
@@ -2132,19 +2550,19 @@ local function drawHWPanel()
       -- distinguishes these, and it is the part that gets truncated away.
       local short = label:gsub(" Drill Tip$", " TIP"):gsub(" Rod$", " ROD")
       if state == "crafting" then
-        put(string.format("  %-24s x%d", short:sub(1, 24), want), 0xFFAA00)
+        putf(0xFFAA00, "  %-24s x%d", short:sub(1, 24), want)
       elseif state == "queued" then
         -- Not a problem: below par, waiting on a crafting CPU. Dim so it reads
         -- as backlog rather than as another thing demanding attention.
-        put(string.format("  %-24s queued x%d", short:sub(1, 24), want), 0x555555)
+        putf(0x555555, "  %-24s queued x%d", short:sub(1, 24), want)
       else
-        put(string.format("  %-24s %s", short:sub(1, 24),
-          state == "nopattern" and "NO PATTERN" or "REJECTED"), 0xFF4444)
+        putf(0xFF4444, "  %-24s %s", short:sub(1, 24),
+             state == "nopattern" and "NO PATTERN" or "REJECTED")
       end
     end
   end
 
-  for r = row, H do dashBlank("H" .. r, P3 + 1, PW, r) end
+  for r = row, H do dashBlank(SLOT_H + r, P3 + 1, PW, r) end
 end
 
 local function drawStaticFrame()
@@ -2168,12 +2586,51 @@ local function drawStaticFrame()
   end
 end
 
+-- Centre a label inside a button's fixed width. The brackets are the only thing
+-- on this screen that says "pressable", so they are not decoration.
+local function btnLabel(b, text)
+  local pad  = math.max(0, (b.w - 2) - #text)
+  local left = math.floor(pad / 2)
+  return "[" .. string.rep(" ", left) .. text .. string.rep(" ", pad - left) .. "]"
+end
+
+-- Cached like every other row, so a settled dashboard repaints neither button.
+local function drawButtons()
+  dashRow(SLOT_BTN_E, BTN_SETTINGS.x, BTN_SETTINGS.w, BTN_Y,
+          btnLabel(BTN_SETTINGS, "SETTINGS"), 0x00AAFF)
+  -- The button says what pressing it DOES; the text beside it says what the
+  -- broker is doing. A button labelled with the current state reads exactly
+  -- backwards half the time, and there is no room here for a legend.
+  dashRow(SLOT_BTN_P, BTN_PAUSE.x, BTN_PAUSE.w, BTN_Y,
+          btnLabel(BTN_PAUSE, dispatchPaused and "RESUME" or "PAUSE"),
+          dispatchPaused and 0x00FF00 or 0xFFAA00)
+  if dispatchPaused then
+    dashRow(SLOT_BTN_S, BTN_STATUS_X, BTN_STATUS_W, BTN_Y,
+            "DISPATCH PAUSED -- running jobs finish", 0xFFAA00)
+  else
+    -- Not blank: the keys are the fallback for a screen that cannot report a
+    -- touch, and nothing else on the dashboard mentions them. Names only the
+    -- ones that are switched on -- a hint for a key that does nothing is worse
+    -- than no hint, because it sends you looking for a broken keyboard.
+    local keys
+    if config.hotkeyEditor and config.hotkeyPause then keys = "or press E / P"
+    elseif config.hotkeyEditor                     then keys = "or press E"
+    elseif config.hotkeyPause                      then keys = "or press P"
+    else                                                keys = "buttons only"
+    end
+    dashRow(SLOT_BTN_S, BTN_STATUS_X, BTN_STATUS_W, BTN_Y, keys, 0x555555)
+  end
+end
+
 local function drawUI()
   if not gpu then return end
+  drawButtons()
   -- Cached like every other row: the clock only changes once a second, and the
   -- dashboard repaints four times a second.
-  dashRow("SYNC", W - 17, 17, 2,
-    "SYNC: " .. os.date("%H:%M:%S", math.floor(getUnixTime())), 0x555555)
+  -- Keyed on the integer second, so os.date and the concatenation run once a
+  -- second rather than on all ten frames within it.
+  dashRowF(SLOT_SYNC, W - 17, 17, 2, 0x555555, "SYNC: %s",
+    os.date("%H:%M:%S", math.floor(getUnixTime())))
   drawModulePanel(); drawDustPanel(); drawHWPanel()
 end
 
@@ -2204,18 +2661,43 @@ local function runBootPrompt()
   }, 1)
   brokerState.priorityMode = (pr == 2) and "rarity" or "threshold"
 
+  -- gtVersion is NOT asked here, deliberately. It is a stored setting, it lives
+  -- on the editor's COMPATIBILITY page, and it changes when you upgrade the pack
+  -- -- which is to say almost never. Prompting for it would ask every boot for a
+  -- value that is already saved, and hand back the saved value as the default.
+  --
+  -- Getting it wrong is not silent: initModules() compares every module's actual
+  -- dialect against it and says so, by name, on the console. That is strictly
+  -- better than a prompt, because it tells you the answer instead of asking you
+  -- for it. Priority mode is asked because it is a genuine per-session choice.
   logger:info("[STARTUP] priority mode = " .. brokerState.priorityMode)
+  -- The whole label, not just the marker. 2.8 differs from 2.9 in two ways --
+  -- marker case AND whether the voltage is in the name -- so a line reading
+  -- only "MK-" cannot tell a right guess from a wrong one, which is exactly how
+  -- a 2.8 world sat there resolving no drones at all.
+  logger:info("[STARTUP] GTNH " .. tostring(config.gtVersion) ..
+              " -- drones named \"" .. tostring(config.drones.uhv) .. "\"")
   if gpu then gpu.setForeground(0x00FF00) end
-  print("\n  Priority: " .. brokerState.priorityMode:upper() .. ".  Starting broker...")
+  print("\n  Priority: " .. brokerState.priorityMode:upper() ..
+        ".  GTNH " .. tostring(config.gtVersion) .. ".  Starting broker...")
   if gpu then gpu.setForeground(0xFFFFFF) end
   os.sleep(1)
 end
 
--- Disable and clear every module's interface. Shows live progress in the MODULES
--- panel so boot feels responsive instead of staring at a blank console while ~24
--- component calls run. Cheap work; this is purely about feedback.
+-- Disable and clear every module's interface, and settle which GTNH parameter
+-- API each one speaks. Shows live progress in the MODULES panel so boot feels
+-- responsive instead of staring at a blank console while ~24 component calls
+-- run. Cheap work; this is purely about feedback.
+--
+-- The dialect is settled HERE, once, rather than at every start: it is a
+-- property of the pack the world is running and it cannot change while the
+-- broker is up. It comes from the gtVersion setting now rather than from a
+-- probe -- see module_api.lua for why an item label forced that -- so this pass
+-- is really about checking the hardware agrees, and about the interface clear.
 local function initModules()
   logger:info("[STARTUP] Initializing " .. #modules .. " modules...")
+  local anyLegacy = false
+  local anyMismatch = nil
   for i, mod in ipairs(modules) do
     if gpu then
       local row = 5 + i
@@ -2224,14 +2706,140 @@ local function initModules()
       gpu.setForeground(0xFFFF00)
       io.write(string.format("  M%d [%-5s]  clearing...", mod.index, mod.tier))
     end
+
+    mod.dialect, mod.dialectHow = moduleApi.resolve(mod.adapter, config.gtVersion)
+    if mod.dialect then
+      if mod.dialect == moduleApi.V28 then anyLegacy = true end
+      logger:info("[STARTUP] M%d speaks %s", mod.index, moduleApi.describe(mod))
+      -- The probe does not decide any more, but it still knows. Comparing it
+      -- against the parameter API the setting implies -- not against the setting
+      -- itself, which is a different string on 2.9-pre-b3 -- is the ONLY chance
+      -- to catch a wrong gtVersion before a job runs: without it a module loads a
+      -- drone,
+      -- a stack of tips and a stack of rods, and only then throws on a
+      -- parameter call that does not exist. Warn, do not fail -- a forced
+      -- setting beating a misreading probe is exactly why the setting exists.
+      local mismatch = moduleApi.check(mod.adapter, config.gtVersion)
+      if mismatch then
+        anyMismatch = anyMismatch or mismatch
+        logger:warn("[STARTUP] M" .. mod.index .. " " .. mismatch)
+      end
+    elseif moduleApi.detect(mod.adapter) then
+      -- The adapter is a mining module, but gtVersion names a version this
+      -- build does not know. Nothing downstream can run against that.
+      mod.status = "ERROR"
+      mod.lastError = "unknown gtVersion: " .. tostring(config.gtVersion)
+      logger:error("[STARTUP] M" .. mod.index .. " " .. mod.lastError)
+    else
+      -- Neither setParameter nor setParameters. That is not a mining module, or
+      -- moduleAddr points at the wrong block. Fail the module, not the boot: the
+      -- other five are probably fine and the dashboard is where you find out.
+      mod.status = "ERROR"
+      mod.lastError = "module API not recognised (no setParameter or setParameters)"
+      logger:error("[STARTUP] M" .. mod.index .. " " .. mod.lastError)
+    end
+
     pcall(function()
       mod.adapter.setWorkAllowed(false)
-      mod.iface.setInterfaceConfiguration(1)
-      mod.iface.setInterfaceConfiguration(2)
-      mod.iface.setInterfaceConfiguration(3)
+      -- At boot we have no idea what a previous run left configured, so this
+      -- deliberately clears the full MAX_CFG_SLOTS -- mod.cfgHigh is unset,
+      -- which is exactly the "clear everything" case.
+      clearInterfaceSlots(mod)
+
+      -- AND THE BUS IS LAST RUN'S STATE TOO.
+      --
+      -- This used to be left alone, and a module that was mining when the
+      -- broker went down kept its drone in bus slot 1 -- physically outside the
+      -- ME network, so hw_telem truthfully reported none, and every module in
+      -- the fleet was dispatched an LV because the model did not know ten LuV
+      -- existed. The loads then pushed those drones back one by one, after the
+      -- jobs were already committed.
+      --
+      -- Emptied, not inspected. A previous version read the bus first so a
+      -- recovered drone could be stamped as in flight -- needed only while the
+      -- pool came from telemetry and a drone outside the network read as gone.
+      -- The declared fleet counts it wherever it is, so putting it back is the
+      -- whole job.
+      returnItemsToME(mod)
     end)
   end
+
+  -- Said once for the whole array, not once per module: on a 2.8 world every
+  -- module is in the same boat, and six identical warnings is how a real one
+  -- gets scrolled past.
+  if anyLegacy then
+    local line = "GTNH 2.8: parallel and cycle are not settable from code -- set them " ..
+                 "in each module's GUI. Dispatch assumes maxParallels for the tier, so " ..
+                 "computation and ETA figures are wrong if the GUI holds less."
+    logger:warn("[STARTUP] " .. line)
+    print(line)
+  end
+
+  -- An undeclared fleet dispatches nothing at all, and the dashboard panel is
+  -- the only other place that says so. Say it at boot too, where someone who
+  -- just upgraded into this change is actually looking.
+  local declared = 0
+  for _, n in pairs(config.droneStock or {}) do declared = declared + (tonumber(n) or 0) end
+  if declared == 0 then
+    local line = "No drones declared -- nothing will dispatch. Set how many you own on " ..
+                 "the editor's HARDWARE page (" .. editorWayIn() .. "). Drone counts are " ..
+                 "configured now rather than read from the hw node, which can only see " ..
+                 "the ME network."
+    logger:warn("[STARTUP] " .. line)
+    print(line)
+  end
+
+  -- The editor key is switchable, and switching it off on a screen that cannot
+  -- report a click leaves no way back into the page that would switch it on.
+  -- Nothing here can detect that -- a screen's tier is not something the GPU
+  -- will answer for -- so say it at boot, every boot, while the console is still
+  -- the thing being looked at.
+  if not config.hotkeyEditor then
+    local line = "Editor key (E) is OFF -- the SETTINGS button on the header is the only " ..
+                 "way in. If this screen does not respond to clicks, set hotkeyEditor " ..
+                 "back to true in /home/user_config.lua."
+    logger:warn("[STARTUP] " .. line)
+    print(line)
+  end
+
+  -- Loud, because the drone labels are wrong too when this fires and the only
+  -- other symptom is every tier reading zero in stock -- which looks like an
+  -- empty network, not a misconfiguration.
+  if anyMismatch then
+    print("WARNING: " .. anyMismatch)
+    print("         Drone item names are picked from the same setting, so stock")
+    print("         will read 0 for every tier until it matches the world.")
+  end
 end
+
+-- =============================================================================
+-- WIRE UP THE EDITOR
+--
+-- Here, not at the dofile above, because every one of these has to exist first
+-- -- drawStaticFrame is the last of them. The editor holds no hardware handles
+-- of its own and reaches for no globals; this list IS its entire coupling to
+-- the broker, which is what keeps it loadable under desktop Lua for the tests.
+--
+-- edGen is passed as a function and edTouch as itself: the counter is the
+-- broker's (the dust panel caches against it too) and a plain number would go
+-- stale the moment it was copied.
+-- =============================================================================
+editor.init{
+  config          = config,
+  gpu             = gpu,
+  W               = W,
+  H               = H,
+  brokerState     = brokerState,
+  drillKeyOrder   = drillKeyOrder,
+  usableDrillKeys = usableDrillKeys,
+  formatQty       = formatQty,
+  drawStaticFrame = drawStaticFrame,
+  -- Closures rather than new top-level locals: this file has spent this whole
+  -- refactor getting back under the 200 ceiling.
+  resetDustScroll = function() dustScroll = 0 end,
+  edTouch         = edTouch,
+  edGen           = function() return edGen end,
+}
 
 -- =============================================================================
 -- MAIN LOOP
@@ -2253,1327 +2861,10 @@ end
 --   - scheduler + module lifecycle: every iteration (loads are time-sensitive)
 --   - messages: serviced with a tiny event.pull timeout so we spin fast
 --   - UI redraw: ~4x/second (humans don't need more; GPU calls are expensive)
---   - dispatch: every DISPATCH_INTERVAL
--- =============================================================================
--- CONDITION EDITOR  (press E on the dashboard)
---
--- Asteroid-first. Pick an asteroid, see what it yields, choose what to stock.
---
--- WHY IT IS SHAPED THIS WAY:
---   config.conditions says WHAT to maintain. config.dustTargets says WHICH
---   asteroid yields it. An entry only ever dispatches if both exist and the
---   item label matches the ME label exactly; otherwise it fails silently as a
---   permanent 0%, which reads as "we have none of this, mine it urgently".
---
---   config.asteroidOutputs holds each asteroid's DIRECT yield, extracted from
---   the installed jar, so those are exact. Everything downstream of ore
---   processing -- Invar, Graphene, Cerium, the rare-earth line -- lives in
---   thousands of runtime recipe registrations and cannot be derived here. So
---   downstream items are TYPED IN by hand. That is not a shortcut; it is the
---   only correct option, and the editor's job is to make it quick and to keep
---   the two config tables consistent with each other.
---
--- SEMANTICS:
---   dustTargets is a MAPPING (where an item comes from). Toggling something off
---   never deletes it -- "Invar comes from the Nickel asteroid" stays true
---   whether or not you currently want Invar. Turning something ON writes the
---   mapping if it is missing, because at that point the asteroid is known.
---   conditions is the PREFERENCE (what to actually stock).
---
--- RUNS AS A UI MODE, NOT A MODAL DIALOG:
---   The main loop keeps calling sched.tick() and stepModules() the whole time
---   this is open, so loads in flight keep progressing. That rules out
---   term.read(): a blocking prompt could stall a load past ARRIVE_TIMEOUT and
---   fail it. All text entry is incremental instead -- every keystroke arrives
---   as an ordinary event through the same loop.
---
--- THREE PAGES, NOT ONE:
---   asteroids/detail/items   what to mine and how much of it to keep.
---   drills                   the consumables that make mining possible at all --
---                            how many tips and rods go into a module, and what
---                            stock level triggers a craft. Same reason it lives
---                            here: those numbers used to mean closing the broker
---                            and editing Lua, and they are exactly the numbers
---                            you want to move while watching a module stall.
---
--- KEYS: up/down/pgup/pgdn/home/end move   enter drill in / commit
---       space toggle   t type amount   T step the ladder   a add downstream item
---       d drills page  / filter       s save    esc back, or close at the top level
--- =============================================================================
+--   - dispatch: every config.dispatchInterval
 
-local USER_CONFIG_PATH   = "/home/user_config.lua"
-local QUOTE              = string.char(34)
-local TARGET_LADDER      = { 1000000, 2000000, 5000000, 10000000, 25000000, 50000000, 100000000 }
-local DEFAULT_TARGET     = 5000000
-
-local edRequestWatchlist = false   -- set on save; main loop re-broadcasts
-local edRequestPar       = false   -- ditto, for DRILL_PAR
-
--- THE DRILL PAGE, IN ONE TABLE.
---
--- Everything else in this file is a plain top-level local, and this would be
--- too if there were room: the main chunk sits within a handful of Lua's
--- 200-local limit, and a dozen more would not fit. Namespacing one feature is
--- the cheap way out, and it happens to read well -- every drill-page constant
--- and helper is reachable from one name.
-local DRILL = {}
-
--- The scalar settings the page can move, in the order they are shown. Every one
--- of these is read live -- the loader runs in this process and reads config on
--- each load, and drillCraftSlots rides along with the next DRILL_PAR broadcast
--- -- so a save takes effect on the next load, not the next reboot.
-DRILL.fields = {
-  { key = "tipsPerLoad",     label = "Drill tips per load",
-    help = "tips put in the bus per module load" },
-  { key = "rodsPerLoad",     label = "Drill rods per load",
-    help = "rods put in the bus per module load" },
-  { key = "tipsToStart",     label = "Tips needed to start",
-    help = "module starts once this many have arrived" },
-  { key = "rodsToStart",     label = "Rods needed to start",
-    help = "module starts once this many have arrived" },
-  { key = "drillCraftSlots", label = "Concurrent drill crafts",
-    help = "match your AE2 crafting CPUs -- too high gets requests rejected" },
-}
-
--- Fallback for a material with no shipped par at all (the top three tiers ship
--- with one, but a hand-trimmed config.lua may not). Deliberately small: turning
--- a material on should not commit the base to an expensive unattended craft.
-DRILL.fallback = { tips = 256, rods = 256, batch = 256 }
-
-local ed = {
-  open = false,
-  mode = "asteroids",          -- "asteroids" | "detail" | "items" | "drills"
-  asteroid = nil,              -- selected asteroid while in detail mode
-  rows = {},                   -- row model for the current mode
-  sel = 1, scroll = 0,
-  filter = nil, filtering = false,
-  input = nil,                 -- { label, buffer, onCommit }
-  enabled = {}, threshold = {},-- working copy of config.conditions
-  targets = {},                -- working copy of config.dustTargets
-  par = {},                    -- working copy of config.drillPar (nil = not ordered)
-  load = {},                   -- working copy of the DRILL.fields settings
-  added = {},                  -- items newly mapped this session
-  msg = "", msgColor = 0x888888,
-  dirty = true,
-}
-
-local function edSay(m, c) ed.msg = m; ed.msgColor = c or 0x888888 end
-
-local function edRows()  return H - 6 end   -- rows 5 .. H-2 hold the list
-local function edFirst() return 5 end
-
--- ---------------------------------------------------------------------------
--- MODEL
--- ---------------------------------------------------------------------------
-
-local function edLoad()
-  ed.enabled, ed.threshold, ed.targets, ed.added = {}, {}, {}, {}
-  for _, cond in ipairs(config.conditions) do
-    ed.enabled[cond.itemName]   = true
-    ed.threshold[cond.itemName] = cond.amountToMaintain
-  end
-  for item, t in pairs(config.dustTargets) do
-    ed.targets[item] = { asteroid = t.asteroid, priority = t.priority or 99 }
-  end
-
-  -- A material ABSENT from config.drillPar is not an error, it is the "never
-  -- order this" state -- so absence is carried through as nil rather than
-  -- filled in with a default, and the page draws it unchecked.
-  ed.par = {}
-  for key, p in pairs(config.drillPar or {}) do
-    if type(p) == "table" then
-      ed.par[key] = { tips = p.tips or 0, rods = p.rods or 0,
-                      batch = p.batch or p.tips or 0 }
-    end
-  end
-
-  ed.load = {}
-  for _, f in ipairs(DRILL.fields) do ed.load[f.key] = config[f.key] end
-end
-
--- "naquadahAlloy" -> "Naquadah Alloy". The tip label is the only place the
--- printable name exists; the key is camelCase and config.drills has no name
--- field of its own.
-function DRILL.name(key)
-  local d = config.drills[key]
-  if d and d.tip then return (d.tip:gsub(" Drill Tip$", "")) end
-  return key
-end
-
--- The kit floor tryDispatch() actually enforces. Derived, never stored, so the
--- page shows it rather than letting you discover it as a module that refuses to
--- go out with plenty of kits on the shelf.
-function DRILL.floor()
-  return math.max(ed.load.tipsPerLoad or 64, ed.load.rodsPerLoad or 64)
-end
-
-local function outputsFor(name)
-  return (config.asteroidOutputs or {})[name]
-end
-
--- Items mapped to this asteroid that are NOT one of its direct yields.
--- Items already covered by the asteroid's derived main/processed lists.
-local function derivedFor(name)
-  local o = outputsFor(name)
-  local set = {}
-  if not o then return set end
-  for _, e in ipairs(o.main or {})      do set[e.item] = true end
-  for _, e in ipairs(o.processed or {}) do set[e.item] = true end
-  return set
-end
-
--- dustTargets entries pointing at this asteroid that the dump did NOT derive.
--- These are the hand-typed ones: alloys, chemical lines, anything past the
--- ore-processing graph the mod walks.
-local function manualFor(name)
-  local derived = derivedFor(name)
-  local list = {}
-  for item, t in pairs(ed.targets) do
-    if t.asteroid == name and not derived[item] then list[#list + 1] = item end
-  end
-  table.sort(list)
-  return list
-end
-
-local function trackedCount(name)
-  local n = 0
-  for item, t in pairs(ed.targets) do
-    if t.asteroid == name and ed.enabled[item] then n = n + 1 end
-  end
-  return n
-end
-
-local function nextPriority(name)
-  local p = 0
-  for _, t in pairs(ed.targets) do
-    if t.asteroid == name and t.priority and t.priority < 90 and t.priority > p then
-      p = t.priority
-    end
-  end
-  return p + 1
-end
-
-local function matchesFilter(s)
-  if not ed.filter or ed.filter == "" then return true end
-  return s:lower():find(ed.filter, 1, true) ~= nil
-end
-
-local function buildAsteroids()
-  local rows = {}
-  local names = {}
-  for name in pairs(config.asteroids) do names[#names + 1] = name end
-  table.sort(names)
-  for _, name in ipairs(names) do
-    if matchesFilter(name) then
-      local a = config.asteroids[name]
-      rows[#rows + 1] = {
-        kind = "asteroid", name = name,
-        tier = a.minModule or 1,
-        drones = string.format("%d-%d", a.minDrone or 0, a.maxDrone or 0),
-        tracked = trackedCount(name),
-        direct = outputsFor(name) ~= nil,
-      }
-    end
-  end
-  return rows
-end
-
--- Three sections, as the data itself divides:
---   MAIN       processing the drop -- macerator, washer, thermal centrifuge,
---              sifter, chemical bath, EM separator. hops=0 means the module
---              drops it finished.
---   PROCESSED  breaking those down further in a centrifuge or electrolyzer.
---   MANUAL     typed in by hand. Everything past the ore-processing graph --
---              alloys, chemical lines -- which no dump can reach.
-local function buildDetail(name)
-  local rows = {}
-  local o = outputsFor(name)
-
-  -- The raw drops are context, not choices: they are ore, processing eats them
-  -- on arrival, and their stock never accumulates. Shown for the item filter.
-  if o and o.drops then
-    local parts = {}
-    for _, dr in ipairs(o.drops) do
-      parts[#parts + 1] = string.format("%s (%.0f%%)", dr.item, (dr.chance or 0) / 100)
-    end
-    rows[#rows + 1] = { kind = "header", text = "DROPS  (for the module item filter -- do not track)" }
-    rows[#rows + 1] = { kind = "note", text = table.concat(parts, "   ") }
-  end
-
-  rows[#rows + 1] = { kind = "header",
-    text = o and "MAIN  (from macerating / washing / centrifuging the drop)"
-             or  "MAIN  -- nothing derived for this asteroid" }
-  if o then
-    for _, e in ipairs(o.main or {}) do
-      if matchesFilter(e.item) then
-        rows[#rows + 1] = { kind = "item", item = e.item, source = e.via, direct = true }
-      end
-    end
-    if #(o.main or {}) == 0 then
-      rows[#rows + 1] = { kind = "note", text = "none" }
-    end
-  end
-
-  rows[#rows + 1] = { kind = "header", text = "PROCESSED  (electrolyzing / centrifuging the above)" }
-  if o and #(o.processed or {}) > 0 then
-    for _, e in ipairs(o.processed) do
-      if matchesFilter(e.item) then
-        rows[#rows + 1] = { kind = "item", item = e.item, source = e.via, direct = true }
-      end
-    end
-  else
-    rows[#rows + 1] = { kind = "note", text = "none" }
-  end
-
-  rows[#rows + 1] = { kind = "header", text = "MANUAL  (typed in -- alloys, chemical lines)" }
-  local man = manualFor(name)
-  if #man == 0 then
-    rows[#rows + 1] = { kind = "note", text = "none yet -- press A to add one" }
-  end
-  for _, item in ipairs(man) do
-    if matchesFilter(item) then
-      rows[#rows + 1] = { kind = "item", item = item, direct = false }
-    end
-  end
-  return rows
-end
-
-local function buildItems()
-  local seen, list = {}, {}
-  for item in pairs(ed.targets)  do if not seen[item] then seen[item] = true; list[#list+1] = item end end
-  for item in pairs(ed.enabled)  do if not seen[item] then seen[item] = true; list[#list+1] = item end end
-  table.sort(list)
-  local rows = {}
-  for _, item in ipairs(list) do
-    if matchesFilter(item) then
-      local t = ed.targets[item]
-      rows[#rows + 1] = { kind = "item", item = item, direct = false,
-                          asteroid = t and t.asteroid or nil, showAsteroid = true }
-    end
-  end
-  return rows
-end
-
--- DRILL CONSUMABLES PAGE
---
--- Two sections, because they answer two different questions and get tuned at
--- different times:
---
---   LOAD BUFFER   how much a module is given, and how little it will settle for
---                 before starting. Tuned when loads feel slow or modules stall
---                 mid-run.
---   RESTOCK PAR   when the hw node auto-crafts more, and how many it asks for.
---                 Tuned when a material keeps running dry, or when an expensive
---                 tier is crafting more eagerly than you want.
---
--- The two are coupled through the dispatch floor, which is why that derived
--- number is spelled out between them rather than left to be rediscovered.
-function DRILL.build()
-  local rows = {}
-
-  rows[#rows + 1] = { kind = "header",
-    text = "LOAD BUFFER  (what a module load puts in the input bus)" }
-  for _, f in ipairs(DRILL.fields) do
-    if matchesFilter(f.label) then
-      rows[#rows + 1] = { kind = "setting", field = f }
-    end
-  end
-
-  local usable = usableDrillKeys()
-  local floor  = DRILL.floor()
-  rows[#rows + 1] = { kind = "note", text = string.format(
-    "a module will not be dispatched unless %d kits of its material are in stock" ..
-    "  (the larger of the two per-load figures)", floor) }
-
-  rows[#rows + 1] = { kind = "header",
-    text = "RESTOCK PAR  (fall below the floor and a whole batch is crafted)" }
-  for _, key in ipairs(drillKeyOrder) do
-    local name = DRILL.name(key)
-    if matchesFilter(name) then
-      rows[#rows + 1] = { kind = "par", key = key, name = name, usable = usable[key] }
-    end
-  end
-
-  return rows
-end
-
-local function edRebuild()
-  edTouch()
-  if ed.mode == "asteroids" then
-    ed.rows = buildAsteroids()
-  elseif ed.mode == "detail" then
-    ed.rows = buildDetail(ed.asteroid)
-  elseif ed.mode == "drills" then
-    ed.rows = DRILL.build()
-  else
-    ed.rows = buildItems()
-  end
-  if ed.sel > #ed.rows then ed.sel = #ed.rows end
-  if ed.sel < 1 then ed.sel = 1 end
-  local maxScroll = math.max(0, #ed.rows - edRows())
-  if ed.scroll > maxScroll then ed.scroll = maxScroll end
-  if ed.scroll < 0 then ed.scroll = 0 end
-end
-
-local function edFollow()
-  if ed.sel < ed.scroll + 1 then ed.scroll = ed.sel - 1 end
-  if ed.sel > ed.scroll + edRows() then ed.scroll = ed.sel - edRows() end
-  if ed.scroll < 0 then ed.scroll = 0 end
-end
-
--- Headers and notes are not selectable; step over them.
-local function edMoveSel(delta)
-  local n = #ed.rows
-  if n == 0 then return end
-  local i = ed.sel
-  for _ = 1, n do
-    i = i + delta
-    if i < 1 then i = 1 break end
-    if i > n then i = n break end
-    local k = ed.rows[i] and ed.rows[i].kind
-    if k ~= "header" and k ~= "note" then break end
-  end
-  ed.sel = i
-  edFollow()
-end
-
-local function selectedRow()
-  local r = ed.rows[ed.sel]
-  if r and (r.kind == "header" or r.kind == "note") then return nil end
-  return r
-end
-
--- Entry point used by the main loop when E is pressed.
-local function edBuild()
-  edLoad()
-  ed.mode, ed.asteroid = "asteroids", nil
-  ed.sel, ed.scroll, ed.filter, ed.filtering, ed.input = 1, 0, nil, false, nil
-  edRebuild()
-end
-
--- ---------------------------------------------------------------------------
--- MUTATIONS
--- ---------------------------------------------------------------------------
-
-local function edToggle(item, asteroid)
-  edTouch()
-  if ed.enabled[item] then
-    ed.enabled[item] = nil
-    edSay("stopped tracking " .. item)
-    return
-  end
-  ed.enabled[item]   = true
-  ed.threshold[item] = ed.threshold[item] or DEFAULT_TARGET
-  -- Turning something on is the moment the mapping has to exist, and here the
-  -- asteroid is known, so write it rather than leaving a condition that can
-  -- never dispatch.
-  if asteroid and not ed.targets[item] then
-    ed.targets[item] = { asteroid = asteroid, priority = nextPriority(asteroid) }
-    ed.added[item] = true
-    edSay("tracking " .. item .. " at " .. formatQty(ed.threshold[item]) ..
-          "  (mapped to " .. asteroid .. ")", 0x00FF00)
-  elseif not ed.targets[item] then
-    edSay("tracking " .. item .. " -- but it has no asteroid, so it cannot mine", 0xFF4444)
-  else
-    edSay("tracking " .. item .. " at " .. formatQty(ed.threshold[item]), 0x00FF00)
-  end
-end
-
-local function edCycleTarget(item)
-  edTouch()
-  local cur = ed.threshold[item] or 0
-  local nxt = TARGET_LADDER[1]
-  for _, v in ipairs(TARGET_LADDER) do
-    if v > cur then nxt = v break end
-  end
-  ed.threshold[item] = nxt
-  ed.enabled[item]   = true
-  edSay(item .. " target " .. formatQty(nxt), 0x00FF00)
-end
-
--- Incremental text entry. Never blocks: each keystroke is just another event.
-local function edPrompt(label, onCommit, initial)
-  ed.input = { label = label, buffer = initial or "", onCommit = onCommit }
-end
-
--- "50m" / "2.5m" / "500k" / "1b" / "250000". g is accepted as a synonym for b,
--- and t for trillion, so muscle memory from either convention works.
-local function parseQty(s)
-  if not s then return nil end
-  local num, suffix = s:lower():gsub("%s", ""):match("^(%d+%.?%d*)([kmgbt]?)$")
-  if not num then return nil end
-  num = tonumber(num)
-  local mult = ({ k = 1e3, m = 1e6, g = 1e9, b = 1e9, t = 1e12 })[suffix] or 1
-  return math.floor(num * mult)
-end
-
-local function edAddDownstream()
-  local asteroid = ed.asteroid
-  if not asteroid then return end
-  edPrompt("item label yielded by " .. asteroid .. " (exact ME name):", function(name)
-    if not name or name == "" then edSay("cancelled") return end
-    if ed.targets[name] then
-      edSay(name .. " is already mapped to " .. ed.targets[name].asteroid, 0xFFAA00)
-      return
-    end
-    ed.targets[name] = { asteroid = asteroid, priority = nextPriority(asteroid) }
-    ed.added[name]   = true
-    edPrompt("amount to maintain for " .. name .. " (5m, 500k, 250000):", function(q)
-      local n = parseQty(q)
-      if not n or n <= 0 then
-        ed.threshold[name] = DEFAULT_TARGET
-        edSay("bad amount, defaulted " .. name .. " to " .. formatQty(DEFAULT_TARGET), 0xFFAA00)
-      else
-        ed.threshold[name] = n
-        edSay("added " .. name .. " -> " .. asteroid .. " at " .. formatQty(n), 0x00FF00)
-      end
-      ed.enabled[name] = true
-      edRebuild()
-    end, "5m")
-    edRebuild()
-  end)
-end
-
--- ---------------------------------------------------------------------------
--- SAVE
--- ---------------------------------------------------------------------------
-
-local function fmtQtyLiteral(n)
-  if n >= 1000000 and n % 1000000 == 0 then return string.format("%dm", n / 1000000) end
-  if n >= 1000    and n % 1000    == 0 then return string.format("%dk", n / 1000) end
-  return tostring(n)
-end
-
--- Type an amount rather than cycling to it.
---
--- The ladder is fine for a rough choice and useless for a specific one: getting
--- to 37m meant pressing t past every rung and settling for whichever was
--- closest. The current value is pre-filled in the same shorthand it prints in,
--- so editing 50m to 37m is three keystrokes.
---
--- Entry is incremental, like every other prompt here -- the main loop keeps
--- running while you type, so a load in flight is not stalled by a text field.
-local function edTypeTarget(item)
-  local cur = ed.threshold[item]
-  -- The current value goes in the LABEL, not the buffer. Pre-filling the buffer
-  -- would mean backspacing it away before typing, which is the opposite of the
-  -- point -- you would be editing a field instead of just stating a number.
-  edPrompt("keep how much " .. item .. "?" ..
-           (cur and ("  (now " .. fmtQtyLiteral(cur) .. ")") or "") ..
-           "  e.g. 50m, 2.5m, 500k",
-    function(txt)
-      if not txt or txt == "" then edSay("unchanged") return end
-      local n = parseQty(txt)
-      if not n or n <= 0 then
-        edSay("did not understand '" .. tostring(txt) .. "' -- unchanged", 0xFF4444)
-        return
-      end
-      edTouch()
-      ed.threshold[item] = n
-      ed.enabled[item]   = true
-      edSay(item .. " -> " .. formatQty(n), 0x00FF00)
-      edRebuild()
-    end)
-end
-
--- ---------------------------------------------------------------------------
--- DRILL MUTATIONS
--- ---------------------------------------------------------------------------
-
--- Warnings, not refusals. Every value these complain about is legal and there
--- are reasons to want each of them; what is not acceptable is setting one by
--- accident and finding out days later from a module that will not dispatch.
-function DRILL.warn(key)
-  local floor = DRILL.floor()
-  if key == "tipsToStart" and (ed.load.tipsToStart or 0) > (ed.load.tipsPerLoad or 0) then
-    edSay("tips to start is above tips per load -- the loader clamps it down", 0xFFAA00)
-    return
-  end
-  if key == "rodsToStart" and (ed.load.rodsToStart or 0) > (ed.load.rodsPerLoad or 0) then
-    edSay("rods to start is above rods per load -- the loader clamps it down", 0xFFAA00)
-    return
-  end
-  if key == "tipsPerLoad" or key == "rodsPerLoad" then
-    -- Raising a per-load figure raises the dispatch floor with it, which can
-    -- strand a material that was previously fine.
-    local under = {}
-    for k, par in pairs(ed.par) do
-      if math.min(par.tips or 0, par.rods or 0) < floor then under[#under + 1] = DRILL.name(k) end
-    end
-    if #under > 0 then
-      table.sort(under)
-      edSay("dispatch floor is now " .. floor .. " kits -- par is below that for " ..
-            table.concat(under, ", "), 0xFFAA00)
-    end
-  end
-end
-
-function DRILL.editSetting(f)
-  local cur = ed.load[f.key]
-  edPrompt(f.label .. "?" .. (cur and ("  (now " .. cur .. ")") or "") ..
-           "  -- " .. f.help,
-    function(txt)
-      if not txt or txt == "" then edSay("unchanged") return end
-      local n = parseQty(txt)
-      if not n or n < 1 then
-        edSay("did not understand '" .. tostring(txt) .. "' -- unchanged", 0xFF4444)
-        return
-      end
-      edTouch()
-      ed.load[f.key] = n
-      edSay(f.label .. " -> " .. n, 0x00FF00)
-      DRILL.warn(f.key)
-      edRebuild()
-    end)
-end
-
-function DRILL.toggle(key)
-  edTouch()
-  if ed.par[key] then
-    ed.par[key] = nil
-    edSay(DRILL.name(key) .. " will no longer be auto-crafted", 0xFFAA00)
-  else
-    -- Restore what this material shipped with rather than inventing a number.
-    -- The shipped pars are scaled to what each material costs to make, and that
-    -- scaling is the whole reason they are not all the same.
-    local sh = (config.shippedDrillPar or {})[key] or DRILL.fallback
-    ed.par[key] = { tips = sh.tips or 0, rods = sh.rods or 0,
-                    batch = sh.batch or sh.tips or 0 }
-    edSay(string.format("%s par %d/%d, batch %d", DRILL.name(key),
-      ed.par[key].tips, ed.par[key].rods, ed.par[key].batch), 0x00FF00)
-  end
-  edRebuild()
-end
-
--- Set one field of one material's par.
---
--- Editing a material that is switched off switches it on: you cannot have meant
--- "set the floor to 4096 and keep not ordering it".
-function DRILL.editField(key, field, andThen)
-  local par = ed.par[key]
-  local cur = par and par[field] or nil
-  local what = ({ tips = "drill tip floor", rods = "drill rod floor",
-                  batch = "craft batch size" })[field]
-  edPrompt(what .. " for " .. DRILL.name(key) .. "?" ..
-           (cur and ("  (now " .. cur .. ")") or "") .. "  e.g. 4096, 2k",
-    function(txt)
-      local n = parseQty(txt or "")
-      -- Empty means keep, which is what makes walking all three fields cheap:
-      -- enter, enter, type the one you came for.
-      if not txt or txt == "" then
-        edSay("unchanged")
-        if andThen then andThen() end
-        return
-      end
-      if not n or n < 0 then
-        edSay("did not understand '" .. tostring(txt) .. "' -- unchanged", 0xFF4444)
-        if andThen then andThen() end
-        return
-      end
-      edTouch()
-      if not ed.par[key] then
-        local sh = (config.shippedDrillPar or {})[key] or DRILL.fallback
-        ed.par[key] = { tips = sh.tips or 0, rods = sh.rods or 0,
-                        batch = sh.batch or sh.tips or 0 }
-      end
-      ed.par[key][field] = n
-      edSay(DRILL.name(key) .. " " .. what .. " -> " .. n, 0x00FF00)
-
-      local p, floor = ed.par[key], DRILL.floor()
-      if (field == "tips" or field == "rods") and n < floor then
-        -- The exact stall this feature exists to remove: stock sits at par, so
-        -- nothing is ever crafted, and dispatch still refuses the material.
-        edSay(string.format("%s: %d is below the %d-kit dispatch floor -- it can " ..
-          "sit at par and still never dispatch", DRILL.name(key), n, floor), 0xFF4444)
-      elseif p.batch < math.max(p.tips or 0, p.rods or 0) then
-        edSay(DRILL.name(key) .. ": batch is smaller than the floor -- restocking " ..
-              "will take several crafts", 0xFFAA00)
-      end
-      edRebuild()
-      if andThen then andThen() end
-    end)
-end
-
--- Enter on a par row walks all three fields in turn -- chained prompts, the same
--- shape edAddDownstream uses. Each link is still one non-blocking field, so a
--- load in flight keeps progressing between keystrokes, and esc drops out of the
--- chain wherever you are in it.
-function DRILL.editAll(key)
-  DRILL.editField(key, "tips", function()
-    DRILL.editField(key, "rods", function()
-      DRILL.editField(key, "batch")
-    end)
-  end)
-end
-
--- ---------------------------------------------------------------------------
--- SAVE
---
--- Writes ONLY /home/user_config.lua. config.lua is shipped data -- hand-kept
--- tables plus the generated asteroidOutputs block -- and gets regenerated
--- wholesale, so anything written there would be destroyed on the next update.
--- One writer per file: this editor owns user_config.lua and nothing else, and
--- nothing else ever writes it.
---
--- Only mappings that are genuinely yours are persisted, worked out against
--- config.shippedDustTargets, the snapshot config.lua takes before applying the
--- overlay. Writing all of them back would freeze the shipped table and mask
--- every future label correction. The same diff is applied to drillPar and to
--- the load scalars, against their own snapshots, for the same reason.
---
--- Every table the overlay reads has to be emitted here, because the file is
--- rewritten whole. Before the drill page existed this function wrote only
--- conditions and dustTargets, which meant a hand-written drillPar block was
--- destroyed by the next save -- silently, since nothing reads that file back.
--- ---------------------------------------------------------------------------
-
-local function edSave()
-  local shipped = config.shippedDustTargets or {}
-
-  local mine = {}
-  local mineCount = 0
-  for item, t in pairs(ed.targets) do
-    local sh = shipped[item]
-    if not sh or sh.asteroid ~= t.asteroid or sh.priority ~= t.priority then
-      mine[item] = t
-      mineCount = mineCount + 1
-    end
-  end
-
-  local conds = {}
-  for item in pairs(ed.enabled) do conds[#conds + 1] = item end
-  table.sort(conds)
-
-  local out = {}
-  out[#out + 1] = "-- user_config.lua"
-  out[#out + 1] = "--"
-  out[#out + 1] = "-- Written by the broker condition editor (press E). Safe to hand-edit."
-  out[#out + 1] = "-- Nothing else writes this file, and config.lua updates never touch it."
-  out[#out + 1] = "--"
-  out[#out + 1] = "--   conditions   what to keep in stock. Replaces the shipped list."
-  out[#out + 1] = "--   dustTargets  mappings you added or corrected. Merged over the"
-  out[#out + 1] = "--                shipped table, so untouched entries still follow"
-  out[#out + 1] = "--                config.lua."
-  out[#out + 1] = "--   drillPar     restock floors you changed. Merged per material;"
-  out[#out + 1] = "--                false means stop auto-crafting that material."
-  out[#out + 1] = "--   drillLoad    load-buffer settings you changed. Merged per field."
-  out[#out + 1] = ""
-  out[#out + 1] = "return {"
-
-  out[#out + 1] = "  conditions = {"
-  for _, item in ipairs(conds) do
-    local t = ed.targets[item]
-    local ast = t and t.asteroid or nil
-    out[#out + 1] = string.format("    { itemName = %-38s amountToMaintain = %-10d },%s",
-      QUOTE .. item .. QUOTE .. ",", ed.threshold[item] or DEFAULT_TARGET,
-      ast and ("   -- " .. ast) or "   -- NO ASTEROID: cannot dispatch")
-  end
-  out[#out + 1] = "  },"
-
-  out[#out + 1] = "  dustTargets = {"
-  local names = {}
-  for item in pairs(mine) do names[#names + 1] = item end
-  table.sort(names)
-  for _, item in ipairs(names) do
-    local t = mine[item]
-    out[#out + 1] = string.format("    [%s%s%s] = { asteroid = %s%s%s, priority = %d },",
-      QUOTE, item, QUOTE, QUOTE, t.asteroid, QUOTE, t.priority or 99)
-  end
-  out[#out + 1] = "  },"
-
-  -- drillPar: only what differs from the shipped table. A material you switched
-  -- OFF that ships ON has to be written as `false` -- omitting it would just let
-  -- the shipped default come back on the next boot.
-  local shippedPar = config.shippedDrillPar or {}
-  local parOut, parCount = {}, 0
-  for _, key in ipairs(drillKeyOrder) do
-    local sh, cur = shippedPar[key], ed.par[key]
-    if cur == nil then
-      if sh then parOut[key] = false; parCount = parCount + 1 end
-    elseif not sh or sh.tips ~= cur.tips or sh.rods ~= cur.rods or sh.batch ~= cur.batch then
-      parOut[key] = cur; parCount = parCount + 1
-    end
-  end
-
-  out[#out + 1] = "  drillPar = {"
-  for _, key in ipairs(drillKeyOrder) do
-    local v = parOut[key]
-    if v == false then
-      out[#out + 1] = string.format("    %-18s = false,   -- do not auto-craft", key)
-    elseif v then
-      out[#out + 1] = string.format("    %-18s = { tips = %d, rods = %d, batch = %d },",
-        key, v.tips or 0, v.rods or 0, v.batch or 0)
-    end
-  end
-  out[#out + 1] = "  },"
-
-  local shippedLoad = config.shippedDrillLoad or {}
-  local loadCount = 0
-  out[#out + 1] = "  drillLoad = {"
-  for _, f in ipairs(DRILL.fields) do
-    local v = ed.load[f.key]
-    if v and v ~= shippedLoad[f.key] then
-      out[#out + 1] = string.format("    %-16s = %d,", f.key, v)
-      loadCount = loadCount + 1
-    end
-  end
-  out[#out + 1] = "  },"
-
-  out[#out + 1] = "}"
-
-  local w = io.open(USER_CONFIG_PATH, "w")
-  if not w then edSay("cannot write " .. USER_CONFIG_PATH, 0xFF4444) return end
-  w:write(table.concat(out, "\n") .. "\n")
-  w:close()
-
-  -- Apply live. Rebuilding in memory beats re-reading, which every other
-  -- subsystem already holds references into.
-  local fresh = {}
-  for _, item in ipairs(conds) do
-    fresh[#fresh + 1] = { itemName = item, amountToMaintain = ed.threshold[item] or DEFAULT_TARGET }
-  end
-  config.conditions = fresh
-
-  for item, t in pairs(ed.targets) do
-    config.dustTargets[item] = { asteroid = t.asteroid, priority = t.priority }
-  end
-
-  local newDust = {}
-  for _, cond in ipairs(config.conditions) do
-    local prev = brokerState.dust[cond.itemName]
-    newDust[cond.itemName] = { stock = prev and prev.stock or 0,
-                               threshold = cond.amountToMaintain }
-  end
-  brokerState.dust   = newDust
-  dustScroll         = 0
-  edRequestWatchlist = true
-
-  -- Apply the drill side live too. The loader reads config on every load, so the
-  -- buffer sizes take effect on the next one; par has to go over the wire, which
-  -- is what edRequestPar asks the main loop to do rather than waiting out the
-  -- 30s broadcast cadence.
-  for _, f in ipairs(DRILL.fields) do
-    if ed.load[f.key] then config[f.key] = ed.load[f.key] end
-  end
-  local newPar = {}
-  for key, p in pairs(ed.par) do
-    newPar[key] = { tips = p.tips, rods = p.rods, batch = p.batch }
-  end
-  config.drillPar = newPar
-  edRequestPar    = true
-  -- The dust panel caches its sorted list against edGen, and a save can change
-  -- which items exist and what their thresholds are, not just their stock.
-  edTouch()
-
-  edSay(string.format(
-    "saved %d tracked, %d own mappings, %d drill par, %d load setting(s) -> applied live",
-    #conds, mineCount, parCount, loadCount), 0x00FF00)
-end
-
-local edButtons = {}
-local function edLayoutButtons()
-  local defs
-  if ed.mode == "asteroids" then
-    defs = { { "ITEMS", "items" }, { "DRILLS", "drills" }, { "FIND", "find" },
-             { "SAVE", "save" }, { "CLOSE", "close" } }
-  elseif ed.mode == "detail" then
-    defs = { { "BACK", "back" }, { "ADD", "add" }, { "FIND", "find" }, { "SAVE", "save" }, { "CLOSE", "close" } }
-  elseif ed.mode == "drills" then
-    defs = { { "ASTEROIDS", "asteroids" }, { "FIND", "find" }, { "SAVE", "save" },
-             { "CLOSE", "close" } }
-  else
-    defs = { { "ASTEROIDS", "asteroids" }, { "DRILLS", "drills" }, { "FIND", "find" },
-             { "SAVE", "save" }, { "CLOSE", "close" } }
-  end
-  edButtons = {}
-  local x = 2
-  for _, d in ipairs(defs) do
-    local label = " " .. d[1] .. " "
-    edButtons[#edButtons + 1] = { x1 = x, x2 = x + #label - 1, label = label, action = d[2] }
-    x = x + #label + 2
-  end
-end
-
-local X_MARK, X_NAME = 2, 6
-local X_A, X_B, X_C = 44, 56, 68
--- Fourth column, used only by the drills page: what is actually in stock, right
--- beside the floor it is being compared against.
---
--- Every other column here is a fixed offset that quietly assumes a tier-3
--- screen, which the three-panel dashboard needs anyway. This one is guarded
--- rather than assumed, because a narrow screen would not truncate it -- it would
--- collide with the BATCH column and print nonsense.
-DRILL.xStock    = 80
-DRILL.stockFits = W >= 90
-
--- ---------------------------------------------------------------------------
--- EDITOR PAINTER
---
--- edDraw cost ~625 component calls per repaint: a term.setCursor plus an
--- io.write for every field, a setForeground before most of them, and a
--- full-width fill on every one of the ~44 list rows -- all repeated whether or
--- not anything on that row had changed.
---
--- In OpenComputers each of those is a direct call against a per-tick budget, so
--- one repaint spanned several game ticks. With modules loading it competed with
--- the loader's transposer and ME calls for the same budget, which is why the
--- editor felt worst exactly when the miner was busy.
---
--- Three changes:
---   1. gpu.set instead of term.setCursor + io.write -- one call rather than
---      two, and it skips the OpenOS term layer's cursor bookkeeping.
---   2. Colour changes are guarded, so consecutive fields sharing a colour cost
---      one setForeground between them instead of one each.
---   3. Rows are cached by content signature. Moving the selection repaints the
---      two rows that actually changed, not the whole list.
--- ---------------------------------------------------------------------------
-local edCache = {}
-local edFG, edBG
-
--- Call whenever something else has painted over the screen (drawUI, boot). The
--- cache describes what is physically on screen, so if that assumption breaks
--- the cache has to go with it.
-local edLastScroll, edLastMode
-
-local function edInvalidate()
-  edCache = {}
-  edFG, edBG = nil, nil
-  edLastScroll, edLastMode = nil, nil
-end
-
--- Scrolling is the cache's worst case: every visible row shows different
--- content, so every signature misses and the whole list repaints -- the full
--- cold-paint cost, on every keypress once the selection reaches the window edge.
---
--- But a scroll is a SHIFT, not new content. gpu.copy moves the whole block in a
--- single call, leaving only the newly exposed rows to paint.
---
--- The cache is shifted to match, and stays truthful precisely because copy
--- really does move what the cache claims is there. A row whose new content
--- happens to equal the shifted content is then correctly skipped; one that
--- differs -- the selection highlight, usually -- is correctly repainted by the
--- signature check.
-local function edScrollBlock()
-  local first, rows = edFirst(), edRows()
-  local prev, mode = edLastScroll, edLastMode
-  edLastScroll, edLastMode = ed.scroll, ed.mode
-  if not prev or mode ~= ed.mode then return end
-
-  local d = ed.scroll - prev
-  if d == 0 or math.abs(d) >= rows then return end
-
-  -- Source row is further down the list when scrolling down, the top of the
-  -- window when scrolling up. Either way the block moves by -d.
-  gpu.copy(1, (d > 0) and (first + d) or first, W, rows - math.abs(d), 0, -d)
-
-  local moved = {}
-  for y, sig in pairs(edCache) do
-    if y >= first and y < first + rows then
-      local ny = y - d
-      if ny >= first and ny < first + rows then moved[ny] = sig end
-    else
-      moved[y] = sig   -- header and footer rows sit outside the copied block
-    end
-  end
-  edCache = moved
-end
-
--- cells = { {x, s, fg}, ... }, painted left to right over a cleared row.
---
--- `key` identifies the content rather than describing it. Two rows with the
--- same key are guaranteed to hold identical content, so the caller can skip
--- building the cells at all -- which is the expensive part in Lua terms, not
--- the painting.
-local function edPaint(y, key, bg, cells)
-  if edCache[y] == key then return end
-  edCache[y] = key
-
-  if edBG ~= bg then gpu.setBackground(bg); edBG = bg end
-  gpu.fill(1, y, W, 1, " ")
-  for i = 1, #cells do
-    local c = cells[i]
-    if edFG ~= c[3] then gpu.setForeground(c[3]); edFG = c[3] end
-    gpu.set(c[1], y, c[2])
-  end
-end
-
--- True when row y already shows exactly this content, so the caller can skip
--- past it without constructing anything at all.
-local function edFresh(y, key) return edCache[y] == key end
-
-local function edDraw()
-  local title
-  if ed.mode == "asteroids" then
-    title = "CONDITION EDITOR  /  asteroids"
-  elseif ed.mode == "detail" then
-    title = "CONDITION EDITOR  /  " .. tostring(ed.asteroid)
-  elseif ed.mode == "drills" then
-    title = "CONDITION EDITOR  /  drill consumables"
-  else
-    title = "CONDITION EDITOR  /  all tracked items"
-  end
-  edPaint(1, title, 0x000000, { { 2, title, 0x00FF00 } })
-
-  local n = 0
-  for _ in pairs(ed.enabled) do n = n + 1 end
-  local hint
-  if ed.mode == "drills" then
-    hint = string.format("space=on/off  enter=edit all three  t=edit  /=find  s=save  esc=back%s",
-      ed.filter and ("  |  filter: " .. ed.filter) or "")
-  else
-    hint = string.format(
-      "%d tracked  |  space=toggle  t=type amount  T=step  a=add  d=drills  /=find  s=save  esc=back%s",
-      n, ed.filter and ("  |  filter: " .. ed.filter) or "")
-  end
-  edPaint(2, hint, 0x000000, { { 2, hint, 0x888888 } })
-
-  if ed.mode == "asteroids" then
-    edPaint(4, "h:ast", 0x000000, {
-      { X_NAME, "ASTEROID", 0x888888 }, { X_A, "MODULE", 0x888888 },
-      { X_B, "DRONES", 0x888888 },      { X_C, "TRACKED", 0x888888 },
-    })
-  elseif ed.mode == "drills" then
-    edPaint(4, "h:drills", 0x000000, {
-      { X_NAME, "MATERIAL / SETTING", 0x888888 }, { X_A, "TIPS", 0x888888 },
-      { X_B, "RODS", 0x888888 },                 { X_C, "BATCH", 0x888888 },
-      table.unpack(DRILL.stockFits and { { DRILL.xStock, "IN STOCK", 0x888888 } } or {}),
-    })
-  else
-    edPaint(4, "h:" .. ed.mode, 0x000000, {
-      { X_NAME, "ITEM", 0x888888 },  { X_A, "TARGET", 0x888888 },
-      { X_B, "HAVE", 0x888888 },
-      { X_C, ed.mode == "detail" and "VIA" or "ASTEROID", 0x888888 },
-    })
-  end
-
-  edScrollBlock()
-
-  for r = 0, edRows() - 1 do
-    local y   = edFirst() + r
-    local idx = ed.scroll + r + 1
-    local row = ed.rows[idx]
-
-    local sel = (idx == ed.sel and row and row.kind ~= "header" and row.kind ~= "note")
-    -- Content is fully determined by which list entry is here, whether it is
-    -- selected, and the model generation. Same key means the row on screen is
-    -- already right, so skip it before building a single table.
-    local key = idx .. (sel and "*" or "-") .. edGen
-    if edFresh(y, key) then goto continue end
-
-    do
-    local bg = sel and 0x222222 or 0x000000
-    local cells = {}
-
-    if row then
-      if row.kind == "header" then
-        cells[1] = { 2, "-- " .. row.text, 0x00AAFF }
-
-      elseif row.kind == "note" then
-        cells[1] = { 6, row.text, 0x555555 }
-
-      elseif row.kind == "setting" then
-        local f = row.field
-        cells[#cells+1] = { X_NAME, f.label, 0x00FFFF }
-        cells[#cells+1] = { X_A, tostring(ed.load[f.key] or "-"), 0x00FF00 }
-        cells[#cells+1] = { X_C, f.help:sub(1, W - X_C), 0x666666 }
-
-      elseif row.kind == "par" then
-        local par  = ed.par[row.key]
-        local on   = par ~= nil
-        local fg   = on and 0x00FFFF or 0x555555
-        cells[#cells+1] = { X_MARK, on and "[x]" or "[ ]", fg }
-        cells[#cells+1] = { X_NAME, row.name, fg }
-        cells[#cells+1] = { X_A, on and tostring(par.tips)  or "-", fg }
-        cells[#cells+1] = { X_B, on and tostring(par.rods)  or "-", fg }
-        cells[#cells+1] = { X_C, on and tostring(par.batch) or "-",
-                            on and 0x888888 or 0x555555 }
-
-        -- Kits, not tips and rods separately: a kit is what a load consumes,
-        -- and it is what the dispatch floor is counted in.
-        if DRILL.stockFits then
-          local d     = brokerState.drills[row.key]
-          local kits  = (d and d.kits) or 0
-          local floor = on and math.min(par.tips or 0, par.rods or 0) or DRILL.floor()
-          cells[#cells+1] = { DRILL.xStock, tostring(kits) .. " kits",
-            (kits == 0 and 0xFF4444) or (kits >= floor and 0x00FF00) or 0xFFAA00 }
-
-          -- Par is only published for materials a drone in this base actually
-          -- uses. Say so on the row, or switching one on for a tier you do not
-          -- own looks like the save did nothing.
-          if on and not row.usable and W >= DRILL.xStock + 36 then
-            cells[#cells+1] = { DRILL.xStock + 10, "no drone -- not published", 0x666666 }
-          end
-        end
-
-      elseif row.kind == "asteroid" then
-        cells[#cells+1] = { X_NAME, row.name:sub(1, X_A - X_NAME - 1),
-                            row.tracked > 0 and 0x00FFFF or 0x777777 }
-        cells[#cells+1] = { X_A, "MK-" .. tostring(row.tier), 0x888888 }
-        cells[#cells+1] = { X_B, row.drones, 0x888888 }
-        cells[#cells+1] = { X_C, tostring(row.tracked),
-                            row.tracked > 0 and 0x00FF00 or 0x555555 }
-        if not row.direct then
-          cells[#cells+1] = { X_C + 6, "no derived outputs", 0xFFAA00 }
-        end
-
-      else -- item
-        local item = row.item
-        local on   = ed.enabled[item]
-        local fg   = on and 0x00FFFF or 0x555555
-        cells[#cells+1] = { X_MARK, on and "[x]" or "[ ]", fg }
-        cells[#cells+1] = { X_NAME,
-          ((row.direct == false and ed.mode == "detail") and "~ " or "  ")
-          .. item:sub(1, X_A - X_NAME - 3), fg }
-        cells[#cells+1] = { X_A,
-          on and formatQty(ed.threshold[item] or DEFAULT_TARGET) or "-", fg }
-
-        local d    = brokerState.dust[item]
-        local have = d and d.stock or 0
-        local tgt  = ed.threshold[item] or DEFAULT_TARGET
-        cells[#cells+1] = { X_B, formatQty(have),
-          have >= tgt and 0x00FF00 or (have > 0 and 0xFFAA00 or 0x555555) }
-
-        if ed.mode == "detail" then
-          cells[#cells+1] = { X_C, tostring(row.source or "hand-typed"):sub(1, W - X_C),
-                              0x666666 }
-        else
-          local t = ed.targets[item]
-          if t then
-            cells[#cells+1] = { X_C, tostring(t.asteroid):sub(1, W - X_C), 0x888888 }
-          else
-            cells[#cells+1] = { X_C, "NOT MINEABLE", 0xFF4444 }
-          end
-        end
-      end
-    end
-
-    edPaint(y, key, bg, cells)
-    end
-    ::continue::
-  end
-
-  edLayoutButtons()
-  local by    = H - 1
-  local cells = {}
-  for _, b in ipairs(edButtons) do
-    cells[#cells+1] = { b.x1, b.label, 0xFFFFFF }
-  end
-  local pos = string.format("%d-%d/%d", math.min(ed.scroll + 1, #ed.rows),
-    math.min(ed.scroll + edRows(), #ed.rows), #ed.rows)
-  cells[#cells+1] = { W - #pos - 1, pos, 0x888888 }
-  edPaint(by, "b:" .. pos .. ":" .. #edButtons, 0x000000, cells)
-
-  if ed.input then
-    local t = ed.input.label .. " " .. ed.input.buffer .. "_"
-    edPaint(H, "i:" .. t, 0x000000, { { 2, t, 0xFFAA00 } })
-  elseif ed.filtering then
-    local t = "/" .. (ed.filter or "") .. "_    enter=keep  esc=clear"
-    edPaint(H, "f:" .. t, 0x000000, { { 2, t, 0xFFAA00 } })
-  else
-    local t = ed.msg:sub(1, W - 2)
-    edPaint(H, "m:" .. t .. ":" .. tostring(ed.msgColor), 0x000000, { { 2, t, ed.msgColor } })
-  end
-end
-
--- ---------------------------------------------------------------------------
--- INPUT
--- ---------------------------------------------------------------------------
-
-local function edAction(a)
-  if a == "close" then
-    ed.open = false
-    -- Same reason as on open: the panels are about to overwrite these rows, so
-    -- the cache must not claim they still hold editor content.
-    edInvalidate()
-    drawStaticFrame()
-  elseif a == "back" then
-    if ed.mode == "detail" or ed.mode == "drills" then
-      ed.mode, ed.asteroid = "asteroids", nil
-      ed.sel, ed.scroll = 1, 0
-      edRebuild()
-      edMoveSel(1)
-    else
-      edAction("close")
-    end
-  elseif a == "items" then
-    ed.mode = "items"; ed.sel, ed.scroll = 1, 0; edRebuild()
-  elseif a == "drills" then
-    ed.mode, ed.asteroid = "drills", nil
-    ed.sel, ed.scroll = 1, 0
-    edRebuild()
-    edMoveSel(1)   -- row 1 is a header
-  elseif a == "asteroids" then
-    ed.mode, ed.asteroid = "asteroids", nil; ed.sel, ed.scroll = 1, 0; edRebuild()
-  elseif a == "add" then
-    if ed.mode == "detail" then edAddDownstream()
-    else edSay("open an asteroid first, then A adds one of its outputs", 0xFFAA00) end
-  elseif a == "find" then
-    ed.filtering = true; ed.filter = ""; edRebuild()
-  elseif a == "save" then
-    edSave()
-  end
-end
-
-local function edOpenSelected()
-  local row = ed.rows[ed.sel]
-  if not row then return end
-  if row.kind == "asteroid" then
-    ed.mode, ed.asteroid = "detail", row.name
-    ed.sel, ed.scroll = 1, 0
-    edRebuild()
-    edMoveSel(1)
-  elseif row.kind == "setting" then
-    DRILL.editSetting(row.field)
-  elseif row.kind == "par" then
-    DRILL.editAll(row.key)
-  elseif row.kind == "item" and ed.mode == "items" then
-    local t = ed.targets[row.item]
-    if t then
-      ed.mode, ed.asteroid = "detail", t.asteroid
-      ed.sel, ed.scroll = 1, 0
-      edRebuild(); edMoveSel(1)
-    else
-      edSay(row.item .. " has no asteroid mapping", 0xFFAA00)
-    end
-  end
-end
-
--- Returns true if the event was consumed.
-local function edHandle(ev)
-  local kind = ev[1]
-
-  if kind == "touch" then
-    local x, y = ev[3], ev[4]
-    if y == H - 1 then
-      for _, b in ipairs(edButtons) do
-        if x >= b.x1 and x <= b.x2 then edAction(b.action) return true end
-      end
-      return true
-    end
-    if y >= edFirst() and y < edFirst() + edRows() then
-      local idx = ed.scroll + (y - edFirst()) + 1
-      local row = ed.rows[idx]
-      if row and row.kind ~= "header" and row.kind ~= "note" then
-        ed.sel = idx
-        if row.kind == "asteroid" then
-          edOpenSelected()
-        elseif row.kind == "setting" then
-          DRILL.editSetting(row.field)
-        elseif row.kind == "par" then
-          -- Click the column you want rather than walking all three.
-          if     x >= X_A and x < X_B then DRILL.editField(row.key, "tips")
-          elseif x >= X_B and x < X_C then DRILL.editField(row.key, "rods")
-          elseif x >= X_C and x < DRILL.xStock then DRILL.editField(row.key, "batch")
-          else DRILL.toggle(row.key) end
-        elseif x >= X_A and x < X_B then
-          edTypeTarget(row.item)
-        else
-          edToggle(row.item, ed.mode == "detail" and ed.asteroid or
-                             (ed.targets[row.item] and ed.targets[row.item].asteroid))
-          edRebuild()
-        end
-      end
-    end
-    return true
-
-  elseif kind == "scroll" then
-    ed.scroll = ed.scroll - (ev[5] or 0) * 3
-    local maxScroll = math.max(0, #ed.rows - edRows())
-    if ed.scroll > maxScroll then ed.scroll = maxScroll end
-    if ed.scroll < 0 then ed.scroll = 0 end
-    return true
-
-  elseif kind == "key_down" then
-    local ch, code = ev[3], ev[4]
-
-    -- Text entry swallows printable keys. Never blocks the scheduler.
-    if ed.input then
-      if code == 28 then            -- enter
-        local cb, buf = ed.input.onCommit, ed.input.buffer
-        ed.input = nil
-        cb(buf)
-      elseif code == 1 then         -- esc
-        ed.input = nil; edSay("cancelled")
-      elseif code == 14 then        -- backspace
-        ed.input.buffer = ed.input.buffer:sub(1, -2)
-      elseif ch and ch >= 32 and ch < 127 then
-        ed.input.buffer = ed.input.buffer .. string.char(ch)
-      end
-      return true
-    end
-
-    if ed.filtering then
-      if code == 28 then
-        ed.filtering = false; edSay("filter: " .. (ed.filter or ""))
-      elseif code == 1 then
-        ed.filtering = false; ed.filter = nil; edRebuild(); edSay("filter cleared")
-      elseif code == 14 then
-        ed.filter = (ed.filter or ""):sub(1, -2); edRebuild()
-      elseif ch and ch >= 32 and ch < 127 then
-        ed.filter = (ed.filter or "") .. string.char(ch):lower(); edRebuild()
-      end
-      return true
-    end
-
-    if     code == 200 then edMoveSel(-1)
-    elseif code == 208 then edMoveSel(1)
-    elseif code == 201 then edMoveSel(-edRows())
-    elseif code == 209 then edMoveSel(edRows())
-    elseif code == 199 then ed.sel = 1; edMoveSel(1); edMoveSel(-1); edFollow()
-    elseif code == 207 then ed.sel = #ed.rows; edMoveSel(-1); edMoveSel(1); edFollow()
-    elseif code == 28  then edOpenSelected()
-    elseif code == 1   then edAction("back")
-    elseif ch == 32 then
-      local row = selectedRow()
-      if row and row.kind == "item" then
-        edToggle(row.item, ed.mode == "detail" and ed.asteroid or
-                           (ed.targets[row.item] and ed.targets[row.item].asteroid))
-        edRebuild()
-      elseif row and row.kind == "asteroid" then
-        edOpenSelected()
-      elseif row and row.kind == "par" then
-        DRILL.toggle(row.key)
-      elseif row and row.kind == "setting" then
-        DRILL.editSetting(row.field)
-      end
-    elseif ch == 116 then                                   -- t: type an amount
-      local row = selectedRow()
-      if row and row.kind == "item" then edTypeTarget(row.item)
-      elseif row and row.kind == "par" then DRILL.editAll(row.key)
-      elseif row and row.kind == "setting" then DRILL.editSetting(row.field) end
-    elseif ch == 84 then                                    -- T: step the ladder
-      local row = selectedRow()
-      if row and row.kind == "item" then edCycleTarget(row.item) end
-    elseif ch == 97  then edAction("add")
-    elseif ch == 47  then edAction("find")
-    elseif ch == 115 then edAction("save")
-    elseif ch == 105 then edAction("items")
-    elseif ch == 100 then edAction("drills")                -- d: drill consumables
-    end
-    return true
-  end
-
-  return false
-end
-
--- Seconds between dashboard repaints.
---
--- This was 0.25 when every repaint cost 223 component calls and spanned several
--- ticks -- the panels painted progressively, which is why the screen looked
--- continuously busy. With the row cache an unchanged frame costs nothing, so the
--- interval stopped being a throttle and became the only source of latency:
--- updates arrived in four visible steps a second with nothing moving between.
---
--- Worst case here (every row changing on every frame) is ~800 calls/second,
--- which is what the old code spent unconditionally. The realistic case is zero.
--- 0.25 was sized for 223-call repaints. Zero is now the cost of an unchanged
--- frame, so the interval had become the only latency -- but going to 0.05 was
--- overcorrecting: the panels still rebuild their row strings every frame, so
--- 20fps meant five times the Lua work for a screen that mostly does not change.
--- 0.1 is 2.5x more responsive than the original and 2.5x the CPU, on a broker
--- whose CPU budget matters because six loaders share it.
-local UI_INTERVAL = 0.1
-local lastUIDraw  = 0
+-- Dashboard repaint cadence: config.uiInterval. See SETTINGS.md for why 0.1.
+local lastUIDraw = 0
 
 -- ---------------------------------------------------------------------------
 -- QUIESCING BEFORE THE EDITOR
@@ -3590,19 +2881,35 @@ local lastUIDraw  = 0
 --
 -- If loads are still running when the countdown ends we keep waiting rather
 -- than open into the exact contention this exists to avoid -- but only up to
--- QUIESCE_GRACE, so a wedged module cannot lock you out of the editor.
+-- config.quiesceGrace, so a wedged module cannot lock you out of the editor.
+--
+-- Both timings are settings (quiesceSeconds, quiesceGrace); see SETTINGS.md.
 -- ---------------------------------------------------------------------------
-local QUIESCE_SECONDS = 10   -- countdown before the editor opens
--- Extra wait for in-flight work once the countdown ends, then open regardless.
--- Generous on purpose: a three-item load confirms each fingerprint by read-back
--- and waits on ME delivery (ARRIVE_TIMEOUT alone is 15s per item), so a healthy
--- load on a laggy server can easily outlast a short grace -- and opening early
--- lands you in exactly the contention this feature exists to avoid.
-local QUIESCE_GRACE   = 60
-
 local edPending = nil        -- { openAt, hardAt } while counting down
 local edPendingShown = nil   -- last text painted, so we only repaint on change
 local edPendingPaints = -1   -- dashPaints when we last drew it, to detect damage
+
+-- Asking for the editor, from the key or the button. One function because the
+-- two entry points must start the SAME countdown -- a second copy of these two
+-- deadlines is a second thing to get wrong, and getting it wrong opens the
+-- editor while a load is still moving items.
+local function requestEditor()
+  local up = computer.uptime()
+  edPending = { openAt = up + config.quiesceSeconds,
+                hardAt = up + config.quiesceSeconds + config.quiesceGrace }
+  edPendingShown = nil
+end
+
+-- Toggle dispatch, from the key or the button. Logged either way, and with
+-- which one, because a broker that has stopped taking work looks identical to a
+-- broker with nothing to do -- and the log is where you go to tell them apart
+-- an hour later.
+local function togglePause(how)
+  dispatchPaused = not dispatchPaused
+  logger:info("[UI] dispatch " .. (dispatchPaused and "PAUSED" or "resumed") ..
+              " (" .. how .. ")")
+  lastUIDraw = 0   -- repaint the button now, do not wait for the tick
+end
 
 -- How many modules are still doing component-heavy work.
 --
@@ -3640,7 +2947,10 @@ local function drawQuiesce(line1, line2)
   gpu.setForeground(0x888888)
   gpu.set(x + math.max(0, math.floor((w - #line2) / 2)), y + 2, line2)
   gpu.setForeground(0x555555)
-  local hint = "esc to cancel"
+  local hint = "tab or q to cancel, or click SETTINGS again"
+  -- The cancel keys are not the editor hotkey and stay live either way: this box
+  -- is already up, and stranding someone inside a countdown they cannot stop is
+  -- a worse outcome than the keyboard-fiddling the setting exists to prevent.
   gpu.set(x + math.max(0, math.floor((w - #hint) / 2)), y + 3, hint)
   -- Only the rows this box covers are now misdescribed by the cache. Dropping
   -- the whole thing here is what created the repaint loop above.
@@ -3661,8 +2971,7 @@ end
 -- Sent on startup and re-sent periodically, so a node that boots later (or
 -- restarts) picks it up without having to ask.
 -- ---------------------------------------------------------------------------
-local WATCHLIST_INTERVAL = 30   -- seconds between re-broadcasts
-local lastWatchlistSend  = 0
+local lastWatchlistSend = 0
 
 local function broadcastWatchlist()
   local list = {}
@@ -3674,6 +2983,35 @@ local function broadcastWatchlist()
     sender      = nodeId,
     payloadType = "DUST_WATCHLIST",
     data        = list,
+  }))
+end
+
+-- ---------------------------------------------------------------------------
+-- NODE SETTINGS
+--
+-- The scope="node" subset of the settings registry, pushed to the dust and
+-- fluid nodes on the command port. This is what lets those machines ship as a
+-- single file with no config at all, instead of a copy of config.lua they only
+-- ever read three values out of.
+--
+-- The same payload goes to every node; each one applies only the keys it holds
+-- and ignores the rest, so this does not need to know who is listening.
+--
+-- Sent on the same slow timer as the watchlist, and again immediately after a
+-- save, so an edit lands within a second rather than within a cadence. Nodes
+-- cache what they receive, so one that restarts during a broker outage comes
+-- back configured rather than reverting to its fallbacks.
+--
+-- The hw node is not an audience here: it stays off the command port (see the
+-- note beside config.ports), and the one setting it cares about,
+-- drillCraftSlots, already rides along with DRILL_PAR on its own port.
+-- ---------------------------------------------------------------------------
+local function broadcastNodeSettings()
+  modem.broadcast(config.ports.command, serial.serialize({
+    protocol    = "MEDINA_COMMAND",
+    sender      = nodeId,
+    payloadType = "NODE_SETTINGS",
+    data        = config.settingsSpec.nodePayload(config.settings),
   }))
 end
 
@@ -3694,7 +3032,16 @@ end
 local function broadcastDrillPar()
   local list = {}
   local usable = usableDrillKeys()
-  for key, par in pairs(config.drillPar or {}) do
+  -- config.drillRestock off means the hw node is told to order nothing at all,
+  -- whatever config.drillPar says. Building an empty list rather than skipping
+  -- the broadcast is deliberate: the node has to HEAR that it should stop, and
+  -- a broker that simply went quiet is indistinguishable from a broker that is
+  -- down -- which is the state the node keeps its last par through.
+  --
+  -- The par table itself is left untouched, so switching this back on restores
+  -- exactly the floors you had rather than making you re-enter them.
+  local enabled = config.drillRestock ~= false
+  for key, par in pairs(enabled and config.drillPar or {}) do
     local drill = config.drills[key]
     -- An unknown key is a config typo. Skip it rather than shipping a nil label
     -- the node would have to defend against.
@@ -3720,7 +3067,25 @@ local function broadcastDrillPar()
     -- An older config.lua tells us nothing about the CPU count, and guessing
     -- low only slows restocking whereas guessing high produces rejected
     -- requests. Leave it at 1.
-    data        = { par = list, slots = config.drillCraftSlots or 1 },
+    --
+    -- `enabled` is sent as well as the empty table, because those are two
+    -- different states to be in and the node's dashboard should not have to
+    -- guess. An empty par with enabled=true means "nothing is currently
+    -- restockable" -- no drone in stock for any material, say. Empty with
+    -- enabled=false means "you have turned this off". An older broker sends
+    -- neither, which the node reads as enabled.
+    -- droneMark and droneSuffix ride along for the same reason drillCraftSlots
+    -- does: the node holds no config.lua, so it cannot turn a version into an
+    -- item name. It keeps its own default until this arrives, so an older
+    -- broker that sends neither costs nothing.
+    --
+    -- Two scalars rather than the fourteen labels themselves. The node already
+    -- holds the roman-and-voltage table -- it needs it to draw its own fleet
+    -- column -- so shipping the labels would put a second copy on the wire
+    -- every thirty seconds to say what four bytes already say.
+    data        = { par = list, slots = config.drillCraftSlots or 1,
+                    enabled = enabled, droneMark = config.droneMark,
+                    droneSuffix = config.droneSuffix },
   }))
   local n = 0
   for _ in pairs(list) do n = n + 1 end
@@ -3734,44 +3099,111 @@ end
 -- otherwise be 30s away, and a node that just started sits on "Awaiting par"
 -- long enough to look broken.
 pcall(broadcastDrillPar)
+pcall(broadcastNodeSettings)
 
+-- ---------------------------------------------------------------------------
+-- SHUTDOWN
+--
+-- Runs on every exit path, crash included. A broker that dies mid-cycle leaves
+-- its modules exactly as they were: work gates open, so a multiblock keeps
+-- consuming the tips and rods in its bus with nobody watching, and interface
+-- configuration slots still standing, so the ME keeps stocking consumables into
+-- buffers for jobs that will never run. Neither clears itself, and neither is
+-- obvious from looking at the machines -- they look busy.
+--
+-- Everything here is pcall'd individually. This is the last code to run before
+-- the program is gone; one unhappy adapter must not stop the other five modules
+-- being shut down properly.
+--
+-- Goes through loader.clearInterfaceSlots like every other cleanup path, so a
+-- module that was mid-load with several slots allocated has all of them
+-- released rather than the first three.
+-- ---------------------------------------------------------------------------
+local function shutdown()
+  for _, mod in ipairs(modules) do
+    pcall(function() mod.adapter.setWorkAllowed(false) end)
+    pcall(clearInterfaceSlots, mod)
+  end
+end
+
+-- The main loop, as a function so it can be wrapped. It never returns on its
+-- own: the broker runs until it is interrupted or something throws.
+--
+-- The loop body below keeps its original indentation rather than being shifted
+-- in a level. Two hundred lines of pure whitespace change would bury the actual
+-- edits in this file's history for no reading benefit.
+local function mainLoop()
 while true do
   -- 1. Service one inbound message. Very short timeout: returns immediately if a
   --    message is waiting, otherwise yields the CPU for ~10ms and comes back so
   --    the scheduler keeps ticking fast.
   -- Pull ANY event, not just modem_message: the dust panel is scrollable and
   -- nothing else in this program consumes input.
-  local ev = { event.pull(0.01) }
-  if ev[1] == "modem_message" then
-    processMessage(table.unpack(ev))
+  -- Destructured, not collected into a table. This loop spins about a hundred
+  -- times a second and `{ event.pull(...) }` allocated a fresh table on every one
+  -- of those, almost always to look at element 1 and throw the rest away.
+  -- event.pull returns at most six values for the signals this program sees.
+  local e1, e2, e3, e4, e5, e6 = event.pull(0.01)
+  if e1 == "modem_message" then
+    processMessage(e1, e2, e3, e4, e5, e6)
     -- Only DUST_UPDATE can move anything the editor shows (the HAVE column).
     -- HW_UPDATE and FLUID_UPDATE used to force a full repaint too, several times
     -- a minute, for a screen whose contents they cannot affect. Even for dust,
     -- do not repaint here: the 2s tick below already refreshes it, and stock
     -- figures do not need sub-second latency. Keypresses still repaint at once.
 
-  elseif ed.open then
+  elseif editor.isOpen() then
     -- The editor owns input while it is up, but ONLY input. Execution still
     -- falls through to sched.tick() and stepModules() below, so loads in flight
     -- keep progressing while someone edits. That is the whole reason this is a
     -- UI mode rather than a separate blocking program.
-    if edHandle(ev) then ed.dirty = true end
+    --
+    -- The one place that still wants a table -- edHandle indexes it. Built only
+    -- on this branch, which is not the hot path: dispatch is suspended for as
+    -- long as the editor is up.
+    editor.handle({ e1, e2, e3, e4, e5, e6 })
 
-  elseif ev[1] == "scroll" then
-    -- ev = { "scroll", screenAddr, x, y, direction, player }
-    local sx, dir = ev[3], ev[5]
+  elseif e1 == "scroll" then
+    -- signal = "scroll", screenAddr, x, y, direction, player
+    local sx, dir = e3, e5
     if sx and dir and sx >= P2 and sx < P3 then
       dustScroll = dustScroll - dir * 2   -- clamped in drawDustPanel
       lastUIDraw = 0                      -- repaint now, do not wait for the tick
     end
 
-  elseif ev[1] == "key_down" and ev[3] == 101 and not edPending then  -- "e"
-    -- Do not open yet: start quiescing. See QUIESCING above.
-    local up = computer.uptime()
-    edPending = { openAt = up + QUIESCE_SECONDS, hardAt = up + QUIESCE_SECONDS + QUIESCE_GRACE }
-    edPendingShown = nil
+  elseif e1 == "touch" then
+    -- signal = "touch", screenAddr, x, y, button, player
+    if btnHit(BTN_SETTINGS, e3, e4) then
+      if edPending then
+        -- The countdown's own cancel. A screen driven by clicks has no tab or
+        -- q to press, so the button that started it has to be able to call it
+        -- off -- otherwise a mis-click commits you to the editor.
+        edPending, edPendingShown = nil, nil
+        lastUIDraw = 0
+      else
+        requestEditor()
+      end
+    elseif btnHit(BTN_PAUSE, e3, e4) then
+      togglePause("click")
+    end
 
-  elseif ev[1] == "key_down" and ev[4] == 1 and edPending then       -- esc
+  elseif e1 == "key_down" and e3 == 101 and config.hotkeyEditor
+     and not edPending then  -- "e"
+    -- Do not open yet: start quiescing. See QUIESCING above.
+    requestEditor()
+
+  elseif e1 == "key_down" and (e3 == 112 or e3 == 80)
+     and config.hotkeyPause then  -- "p" / "P"
+    -- Works during the editor countdown too: pausing dispatch and opening the
+    -- editor are not alternatives, and a countdown is exactly when you have
+    -- decided to stop the array.
+    togglePause("key")
+
+  elseif e1 == "key_down" and edPending
+     and editor.isCancelKey(e3, e4) then
+    -- Aborting the countdown. Asked of the editor rather than tested here, so
+    -- this cannot drift from EDKEYS -- which is how "esc" outlived the key
+    -- working. Without tab and q this box could not be cancelled at all.
     edPending, edPendingShown = nil, nil
     lastUIDraw = 0   -- wipe the box on the next pass
   end
@@ -3782,45 +3214,38 @@ while true do
     local busy = modulesBusy()
     if up >= edPending.openAt and (busy == 0 or up >= edPending.hardAt) then
       edPending, edPendingShown = nil, nil
-      ed.open = true
-      -- drawUI has been painting over this screen; the row cache describes what
-      -- was there before, so it is now a lie. Drop it.
-      edInvalidate()
-      edBuild()
-      if busy > 0 then
-        -- Opened on the grace rather than because the broker went quiet. Say so:
-        -- otherwise it looks like the wait did not work, and it explains why the
-        -- editor may feel sluggish for the next few seconds.
-        edSay(busy .. " module(s) still working -- editor may lag briefly", 0xFFAA00)
-      else
-        edSay("new jobs paused while this is open -- esc to resume mining")
-      end
-      ed.dirty = true
+      -- The editor drops the row cache and says why it opened; both of those
+      -- are its business, not this loop's.
+      editor.open(busy)
     end
   end
 
   -- A save inside the editor rewrites config.conditions and applies it live, so
   -- push the new watchlist immediately rather than waiting out the 30s cadence.
-  if edRequestWatchlist then
+  local wantWatchlist, wantPar, wantNodes = editor.takeRequests()
+  if wantWatchlist then
     broadcastWatchlist()
-    lastWatchlistSend  = computer.uptime()
-    edRequestWatchlist = false
+    lastWatchlistSend = computer.uptime()
   end
 
   -- Same for drill par. Separate flag rather than folded into the one above,
   -- because edSave sets both and this is the only place broadcastDrillPar is in
   -- scope -- it is defined below the editor. Without it a par change waited out
   -- the 30s cadence, which reads as the edit not having taken.
-  if edRequestPar then
+  if wantPar then
     broadcastDrillPar()
-    edRequestPar = false
+  end
+
+  if wantNodes then
+    broadcastNodeSettings()
   end
 
   -- 1b. Re-publish the dust watchlist on its own slow cadence.
   local nowW = computer.uptime()
-  if nowW - lastWatchlistSend >= WATCHLIST_INTERVAL then
+  if nowW - lastWatchlistSend >= config.watchlistInterval then
     broadcastWatchlist()
-    broadcastDrillPar()  -- one timer, two audiences; par changes just as rarely
+    broadcastDrillPar()      -- one timer, three audiences; all three change rarely
+    broadcastNodeSettings()
     lastWatchlistSend = nowW
   end
 
@@ -3845,17 +3270,17 @@ while true do
   -- that time out of its average.
   computationSample()
 
-  if ed.open then
+  if editor.isOpen() then
     -- Event-driven: repaint when the editor changed, plus a slow tick so live
     -- HAVE values from telemetry still refresh. Repainting a full-screen list
     -- four times a second was the other half of the flicker.
-    if ed.dirty or (up - lastUIDraw >= 2.0) then
-      edDraw()
-      ed.dirty   = false
+    if editor.needsRepaint() or (up - lastUIDraw >= 2.0) then
+      editor.draw()
+      editor.clearRepaint()
       lastUIDraw = up
     end
   else
-    if up - lastUIDraw >= UI_INTERVAL then
+    if up - lastUIDraw >= config.uiInterval then
       drawUI()
       lastUIDraw = up
     end
@@ -3895,19 +3320,49 @@ while true do
   --    mine), hardware (drones/kits available), and fluid (plasma — modules can't
   --    run without it). Wait for all three before dispatching.
   if not brokerState.telemetryReady then
+    -- Back to a plain first-sweep test. This briefly compared the hw sweep
+    -- against when initModules emptied the buses, because dispatching before a
+    -- sweep had seen the returned drones handed every module the weakest drone
+    -- in stock. Drones do not come from a sweep any more; kits still do, and one
+    -- sweep is all that needs waiting for.
     brokerState.telemetryReady = (brokerState.lastDustSyncTime > 0)
         and (brokerState.lastHWSyncTime > 0)
         and (brokerState.lastFluidSyncTime > 0)
   end
 
-  -- 6. Dispatch on its own cadence -- unless we are quiescing for the editor or
-  --    it is already open. Existing work is never interrupted; we simply stop
-  --    starting more, so the broker drains to idle and stays there.
+  -- 6. Dispatch on its own cadence -- unless we are quiescing for the editor, it
+  --    is already open, or someone has paused. Existing work is never
+  --    interrupted; we simply stop starting more, so the broker drains to idle
+  --    and stays there.
   local now = computer.uptime()
-  if brokerState.telemetryReady and not ed.open and not edPending
-     and (now - lastDispatchCheck >= DISPATCH_INTERVAL) then
+  -- `not nodeFault()` sits here beside the other gates rather than inside
+  -- dispatchBatch, because it is the same kind of condition as the two next to
+  -- it: a reason not to start new work, not a rule about how work is chosen.
+  if brokerState.telemetryReady and not editor.isOpen() and not edPending
+     and not dispatchPaused
+     and not nodeFault()
+     and (now - lastDispatchCheck >= config.dispatchInterval) then
     dispatchBatch()
     lastDispatchCheck = now
   end
 
+end
+end
+
+-- Wrapped, so a throw anywhere in the loop lands here instead of killing the
+-- program outright and leaving the array running. space-pumping/autoPump.lua
+-- has done this since it was written; the broker never did, which is why an
+-- unexpected nil from a component could take six mining modules with it.
+local ok, err = xpcall(mainLoop, debug.traceback)
+
+pcall(shutdown)
+
+if gpu then pcall(function() gpu.setForeground(0xFFFFFF) end) end
+if ok then
+  logger:info("clean shutdown")
+  print("Broker stopped. All modules gated off.")
+else
+  logger:error("CRASH: " .. tostring(err))
+  print("broker-mk3 crashed - all modules gated off and interfaces cleared.")
+  print(tostring(err))
 end
