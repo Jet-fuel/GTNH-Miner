@@ -1521,10 +1521,11 @@ end
 -- That costs the off/on only when the job actually changes.
 --
 -- The rule mirrors dispatch: needs are served in priority order, one module per
--- need before any need gets a second. Keep the asteroid while it is still a
--- need and no higher-priority need is going without a module that only this
--- one could give it -- i.e. there are not more unserved, reachable needs ahead
--- of it than idle modules to take them.
+-- need before any need gets a second, and no asteroid holds more than its cap
+-- unless nothing else could use the module. Keep the asteroid while it is still
+-- a need, there are not more unserved reachable needs ahead of it than idle
+-- modules to take them, and -- if this module is over the asteroid's cap -- no
+-- other need is going without.
 --
 -- A field on brokerState, not a local: restockRunning is above the dispatch
 -- helpers this needs, and the main chunk is at Lua's 200-local ceiling.
@@ -1561,15 +1562,6 @@ brokerState.keepsJob = function(mod)
   end
 
   local counts = activeAsteroidCounts()
-  local unserved, seen = 0, {}
-  for i = 1, myRank - 1 do
-    local ast = needs[i].asteroid
-    if not seen[ast] and (counts[ast] or 0) == 0 and reachable(ast) then
-      unserved = unserved + 1
-    end
-    seen[ast] = true
-  end
-  if unserved == 0 then return true end
 
   -- Counted here rather than via getIdleModules, which also recovers modules
   -- from ERROR -- a side effect a question must not have.
@@ -1577,9 +1569,58 @@ brokerState.keepsJob = function(mod)
   for _, m in ipairs(modules) do
     if m.dialect and m.status == "IDLE" then idle = idle + 1 end
   end
-  if unserved <= idle then return true end
-  return false, string.format("%d higher-priority need(s) have no module and %d module(s) are idle",
-    unserved, idle)
+
+  -- Reachable needs on some other asteroid that nobody is mining, among the
+  -- first `upTo` of the list (the whole list when nil).
+  local function unservedNeeds(upTo)
+    local n, seen = 0, {}
+    for i = 1, (upTo or #needs) do
+      local ast = needs[i].asteroid
+      if ast ~= job.asteroid and not seen[ast] and (counts[ast] or 0) == 0 and reachable(ast) then
+        n = n + 1
+      end
+      seen[ast] = true
+    end
+    return n
+  end
+
+  -- 1. Priority: a higher-priority need is going without, and there are not
+  --    enough idle modules to give it one.
+  local ahead = unservedNeeds(myRank - 1)
+  if ahead > idle then
+    return false, string.format("%d higher-priority need(s) have no module and %d module(s) are idle",
+      ahead, idle)
+  end
+
+  -- 2. The per-asteroid cap, computed the way dispatch computes it. Dispatch
+  --    lifts the cap only for modules nothing else could use, so a module over
+  --    it keeps its asteroid only while every other reachable need already has a
+  --    module or an idle one to take it.
+  --
+  --    Which modules count as over is settled by index: the lowest `cap` on the
+  --    asteroid keep it and only the ones after them are asked to move. Without
+  --    that, every module on the asteroid would see the same answer and they
+  --    would all hand back at once.
+  local nReachable = 0
+  for _, need in ipairs(needs) do
+    if reachable(need.asteroid) then nReachable = nReachable + 1 end
+  end
+  local cap = asteroidCap(nReachable)
+  local pos = 0
+  for _, m in ipairs(modules) do
+    if m.status ~= "IDLE" and m.job and m.job.asteroid == job.asteroid then
+      pos = pos + 1
+      if m == mod then break end
+    end
+  end
+  if pos > cap then
+    local elsewhere = unservedNeeds(nil)
+    if elsewhere > idle then
+      return false, string.format("%s is over its cap of %d and %d other need(s) have no module",
+        job.asteroid, cap, elsewhere)
+    end
+  end
+  return true
 end
 
 -- Dispatch a pinned/reserved module to its fixed asteroid, ignoring dust

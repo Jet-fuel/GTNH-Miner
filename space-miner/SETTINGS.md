@@ -276,6 +276,11 @@ rule dispatch uses to hand out needs:
 - **Keep** while the asteroid is still on the needs list, and there are no more
   unserved, reachable needs of higher priority than there are idle modules to
   take them.
+- **Respect the cap** (`asteroidCap`, the "CAP: n/asteroid" on the dashboard):
+  if more modules are on the asteroid than the cap allows — dispatch lifts the
+  cap when nothing else needs mining — the lowest-numbered modules up to the cap
+  keep it, and the rest hand back as soon as another need has no module and no
+  idle module to take it.
 - **Hand back** otherwise: the filters are cleared, the module runs down its
   bus, goes DONE, and dispatch places it on whatever is needed now. If the
   answer turns back to *keep* before it runs dry, the filters are set again and
