@@ -28,10 +28,13 @@
 --               face whose count of it GOES UP is the interface side. Counting
 --               the rise rather than looking for the item means a bus already
 --               holding tips cannot be mistaken for the interface.
---   Bus         each unclaimed me_inputbus is given the item as a filter; the
---               face that goes up is the input bus side, and that bus is this
---               module's busAddr. An adapter and an MFU look the same here.
---               With no bus component, the input bus is the one other face.
+--   Bus         the stocking bus no other module owns, by the same "exactly one
+--               new" rule as the other components, and then proven by setting a
+--               filter and reading it back (getConfiguration). With several,
+--               the one that makes the item appear on this module's bus face --
+--               which needs the machines running. An adapter and an MFU look
+--               the same here. The input bus side is the one face besides the
+--               interface.
 --   Verified    a real round trip: one item interface -> bus -> back, the same
 --               transferItem() the loader performs.
 --
@@ -345,7 +348,18 @@ local function probeModule(entry, claimed)
     if inv.side ~= ifaceSide then others[#others + 1] = inv end
   end
 
-  -- --- Bus: give each unclaimed stocking bus the filter, see which face rises
+  -- --- Bus: which stocking bus is this module's? ---------------------------
+  --
+  -- Candidates are the stocking buses no other module owns. Which one belongs
+  -- to THIS module is settled the same way as the machine, interface and
+  -- transposer above: exactly one new component of the type is this module's.
+  -- Whatever is picked must then prove it works: a filter is set and read back
+  -- with getConfiguration, which the bus answers itself, machine running or not.
+  --
+  -- With several candidates the "exactly one" rule cannot decide, so they are
+  -- told apart by which one makes the item appear on this module's bus face. A
+  -- regular stocking bus only pulls while its machine runs, so that only works
+  -- with the module on.
   local busSide, busAddr, busNote
   local cands = {}
   for addr in component.list(TYPE_BUS) do
@@ -353,8 +367,29 @@ local function probeModule(entry, claimed)
   end
   table.sort(cands)
 
+  -- Set the probe filter, read it back, clear it. True if the bus took it.
+  local function takesFilter(bus)
+    local okSet, setErr = pcall(bus.setConfiguration, PROBE_BUS_SLOT, detail)
+    if not okSet then return false, "setConfiguration failed: " .. tostring(setErr) end
+    local okGet, cfg = pcall(bus.getConfiguration, PROBE_BUS_SLOT)
+    pcall(bus.setConfiguration, PROBE_BUS_SLOT)
+    if not okGet then return false, "getConfiguration failed: " .. tostring(cfg) end
+    if type(cfg) ~= "table" or cfg.label ~= probeLabel then
+      return false, "filter read back as " .. tostring(type(cfg) == "table" and cfg.label or cfg)
+    end
+    return true
+  end
+
   if #cands == 0 then
     busNote = "no unclaimed " .. TYPE_BUS .. " reachable (only needed for stockingMode = filter)"
+  elseif #cands == 1 then
+    local ok, why = takesFilter(component.proxy(cands[1]))
+    if ok then
+      busAddr = cands[1]
+      print("  -> busAddr       = " .. busAddr .. "  (the one new stocking bus; filter read back OK)")
+    else
+      busNote = "the one new stocking bus " .. cands[1] .. " did not take a filter: " .. why
+    end
   else
     for _, addr in ipairs(cands) do
       local bus = component.proxy(addr)
@@ -370,14 +405,20 @@ local function probeModule(entry, claimed)
         if extra > 0 then
           moveCount(transposer, side, sizeOf(invs, side), ifaceSide, probeLabel, extra)
         end
-        busSide, busAddr = side, addr
-        print("  -> busAddr       = " .. addr)
+        local ok, why = takesFilter(bus)
+        if ok then
+          busSide, busAddr = side, addr
+          print("  -> busAddr       = " .. addr .. "  (item appeared on this module's bus face)")
+        else
+          busNote = "bus " .. addr .. " fed this module but did not read its filter back: " .. why
+        end
         break
       end
     end
-    if not busAddr then
-      busNote = "no stocking bus showed the item here; a regular stocking bus only pulls " ..
-                "while its machine runs -- start the module and run `detect_module fix`"
+    if not busAddr and not busNote then
+      busNote = #cands .. " unclaimed stocking buses and none fed this module's bus face. " ..
+                "Add one module and its bus at a time, or start the modules and run " ..
+                "`detect_module fix`"
     end
   end
 
