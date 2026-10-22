@@ -178,6 +178,7 @@ end
 
 local function clearBusFilters(mod)
   for slot = 1, BUS_FILTER_SLOTS do mod.bus.setConfiguration(slot) end
+  mod.filtersSet = false   -- whoever sets them next logs it again
 end
 
 -- Clear the interface configuration slots this module may currently be holding.
@@ -196,7 +197,10 @@ end
 -- load uses. The `or MAX_CFG_SLOTS` covers a module whose cfgHigh was never set
 -- at all -- clear everything rather than guess low, since guessing low leaves
 -- the ME stocking items nobody asked for.
-local function clearInterfaceSlots(mod)
+--
+-- `keepBusFilters` is for the one caller that must not clear them: a filter-mode
+-- load, which sets them on purpose and is finished with only the interface.
+local function clearInterfaceSlots(mod, keepBusFilters)
   local high = math.max(mod.cfgHigh or MAX_CFG_SLOTS, 3)
   for slot = 1, high do
     mod.iface.setInterfaceConfiguration(slot)
@@ -206,7 +210,7 @@ local function clearInterfaceSlots(mod)
   -- A bus filter left set is the same leak as a configured interface slot: ME
   -- keeps feeding a bus nobody is using. Cleared whatever the stocking mode, so
   -- switching the setting mid-run cannot strand one.
-  if mod.bus then clearBusFilters(mod) end
+  if mod.bus and not keepBusFilters then clearBusFilters(mod) end
 end
 
 -- ---------------------------------------------------------------------------
@@ -363,11 +367,38 @@ function loader.run(mod, job, deps)
       "; continuing -- items are matched by label, not slot")
   end
 
+  -- FILTER MODE (stockingMode = "filter"): tips and rods come from the stocking
+  -- bus filters, so the only thing this load moves is the drone. The filters go
+  -- in first: if the bus will not take them, this load falls back to moving
+  -- tips and rods as usual, rather than starting a module with nothing coming.
+  --
+  -- Nothing waits for them to arrive. A regular stocking bus pulls when its
+  -- machine asks, and the machine is not switched on until this load returns --
+  -- waiting here would wait forever.
+  local filterMode = false
+  if config.stockingMode == "filter" and mod.bus then
+    local okF, ferr = setBusFilters(mod, {
+      { label = drillEntry.tip, busSlot = 1 },
+      { label = drillEntry.rod, busSlot = 2 },
+    })
+    if okF then
+      filterMode = true
+      mod.filtersSet = true
+      stats.filterMode = true
+      logger:info("[LOAD] M%d bus filters set: %s, %s -- moving the drone only",
+        mod.index, drillEntry.tip, drillEntry.rod)
+    else
+      logger:warn("[LOAD] M%d could not set bus filters (%s); moving tips and rods instead",
+        mod.index, tostring(ferr))
+    end
+  end
+
   -- 2. Write fingerprints, confirming each by read-back before moving on.
-  local items = {
-    { slot = slotTip,   label = drillEntry.tip,  tag = "tip"   },
-    { slot = slotRod,   label = drillEntry.rod,  tag = "rod"   },
-  }
+  local items = {}
+  if not filterMode then
+    items[#items + 1] = { slot = slotTip, label = drillEntry.tip, tag = "tip" }
+    items[#items + 1] = { slot = slotRod, label = drillEntry.rod, tag = "rod" }
+  end
   if not fast then
     table.insert(items, 1, { slot = slotDrone, label = droneName, tag = "drone" })
   end
@@ -421,8 +452,10 @@ function loader.run(mod, job, deps)
       end
     end
     if not fast then mod.iface.setInterfaceConfiguration(1, dbAddr, slotDrone, 1) end
-    alloc("tip", slotTip, TIPS_START)
-    alloc("rod", slotRod, RODS_START)
+    if not filterMode then
+      alloc("tip", slotTip, TIPS_START)
+      alloc("rod", slotRod, RODS_START)
+    end
     -- Remember how far we went, so whoever clears up knows how many slots to
     -- pay for. max() rather than assignment: a previous load that ended without
     -- clearing may still be holding slots above this one.
@@ -623,6 +656,16 @@ function loader.run(mod, job, deps)
                   "drone mismatch in bus: expected " .. droneName ..
                   ", got " .. (droneStack and droneStack.label or "empty")
   end
+  -- Filter mode moved its drone and is done: the bus feeds tips and rods once
+  -- the machine runs, and the filters must survive the clear below.
+  if filterMode then
+    clearInterfaceSlots(mod, true)
+    stats.fillSecs = 0
+    stats.startedWith = { tips = 0, rods = 0 }
+    stats.bufferTarget = { tips = TIPS_PER, rods = RODS_PER }
+    return true, stats
+  end
+
   local fillAt = computer.uptime()
   local ok, shortLabel = drain({
     { label = drillEntry.tip, target = TIPS_START },

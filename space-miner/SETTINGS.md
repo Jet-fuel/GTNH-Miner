@@ -290,8 +290,10 @@ The filters are cleared together with the interface slots whenever the module
 stops — a filter left set would keep ME feeding a bus nobody is using, which is
 the same leak the interface clearing exists to prevent.
 
-What this version does **not** change: the initial load still moves tips and
-rods by transfer. A regular stocking bus pulls when the machine asks for items, so the
+A load in filter mode sets the filters first and then fetches and moves only the
+drone; it does not wait for tips and rods, since the bus feeds them once the
+machine is switched on. If the bus will not take the filters, that load moves
+tips and rods as usual and logs why. A regular stocking bus pulls when the machine asks for items, so the
 filter path relies on the machine running; it fills instantly while it is.
 
 ### `config.drillPar` — per-material restock floors
