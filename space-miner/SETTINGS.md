@@ -266,11 +266,29 @@ machine runs, so if a new module's bus is not found, start the module and run
 A module without `busAddr` keeps transferring and logs a warning once, so one
 unconfigured module does not hold the others back.
 
-The filters are set on the first restock pass after a module starts and stay set
-for the whole run, so the module never has to stop for tips or rods. They are
-cleared together with the interface slots whenever the module stops — a filter
-left set would keep ME feeding a bus nobody is using, which is the same leak the
-interface clearing exists to prevent.
+The filters are set on the first restock pass after a module starts. From then
+on the module is fed for as long as they stay set, so it no longer runs dry on
+its own — and running dry is what normally sends a module back to dispatch to
+be given whatever is needed most. So on every restock pass (every 3 s) the
+broker asks whether this module should **keep its asteroid**, using the same
+rule dispatch uses to hand out needs:
+
+- **Keep** while the asteroid is still on the needs list, and there are no more
+  unserved, reachable needs of higher priority than there are idle modules to
+  take them.
+- **Hand back** otherwise: the filters are cleared, the module runs down its
+  bus, goes DONE, and dispatch places it on whatever is needed now. If the
+  answer turns back to *keep* before it runs dry, the filters are set again and
+  the restart is saved.
+
+The result is that a module only goes off and on when its job actually
+changes, while every need still gets a module before any gets a second — so
+one well-stocked asteroid cannot hold the whole fleet. A pinned module keeps its
+asteroid by definition and is never asked.
+
+The filters are cleared together with the interface slots whenever the module
+stops — a filter left set would keep ME feeding a bus nobody is using, which is
+the same leak the interface clearing exists to prevent.
 
 What this version does **not** change: the initial load still moves tips and
 rods by transfer. A regular stocking bus pulls when the machine asks for items, so the

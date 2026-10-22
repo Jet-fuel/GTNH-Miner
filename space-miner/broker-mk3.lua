@@ -740,21 +740,37 @@ local function restockRunning(mod)
   }
 
   -- FILTER MODE: set the bus filters and let ME feed the bus. One call per
-  -- consumable, nothing to wait for and nothing to move, so the pass is settled
-  -- as soon as the filters are in. They stay set for the run (a pinned module
-  -- re-asserts them every interval, which costs two calls) and are cleared with
-  -- the interface slots when the module stops.
+  -- consumable, nothing to wait for and nothing to move.
+  --
+  -- The filters stay set only while brokerState.keepsJob says this module
+  -- should keep its asteroid -- see the note there: with the bus fed forever, a
+  -- module would otherwise never run dry and never be re-dispatched. When the
+  -- answer turns to no they are cleared and the module runs down to DONE. If it
+  -- turns back to yes before then, they are set again and the restart is saved.
+  -- A pinned module keeps its asteroid by definition and is not asked.
+  --
+  -- Set once per run (mod.filtersSet), not every pass: two calls every three
+  -- seconds per module buys nothing. Cleared with the interface slots on stop.
   --
   -- A module without busAddr falls back to transfer, warned once, so one
   -- unconfigured module cannot stop the others from using the setting.
   if config.stockingMode == "filter" then
     if mod.bus then
+      local keep, why = true, nil
+      if not mod.pinnedAsteroid then keep, why = brokerState.keepsJob(mod) end
+      if not keep then
+        if mod.filtersSet then
+          loader.clearBusFilters(mod)
+          mod.filtersSet = false
+          logger:info("[RESTOCK] M%d bus filters cleared, running down: %s", mod.index, tostring(why))
+        end
+        return true
+      end
+      if mod.filtersSet then return true end
       local okF, ferr = loader.setBusFilters(mod, wanted)
       if okF then
-        if not mod.filtersSet then
-          mod.filtersSet = true
-          logger:info("[RESTOCK] M%d bus filters set: %s, %s", mod.index, drill.tip, drill.rod)
-        end
+        mod.filtersSet = true
+        logger:info("[RESTOCK] M%d bus filters set: %s, %s", mod.index, drill.tip, drill.rod)
         return true
       end
       logger:warn("[RESTOCK] M%d could not set bus filters (%s), transferring instead",
@@ -807,7 +823,10 @@ local function stepRunning(mod)
   -- Pinned modules top up for as long as they run. Everyone else only until the
   -- initial buffer is complete, or until the window closes -- after that the
   -- module is allowed to run dry, finish, and be given a different job.
+  -- Filter mode asks for the whole run too: each pass is where it decides
+  -- whether this module keeps its asteroid (see brokerState.keepsJob).
   local topUpWanted = mod.pinnedAsteroid
+      or (config.stockingMode == "filter" and mod.bus ~= nil)
       or (not mod.bufferFilled
           and (now - (mod.runStartedAt or now)) < (config.topUpWindow or 30))
   if mod.job and topUpWanted then
@@ -817,7 +836,8 @@ local function stepRunning(mod)
         local ok, full = pcall(restockRunning, mod)
         if not ok then
           logger:warn("[RESTOCK] M" .. mod.index .. " error: " .. tostring(full))
-        elseif full and not mod.pinnedAsteroid then
+        elseif full and not mod.pinnedAsteroid and not mod.bufferFilled then
+          -- Once per run: filter mode keeps passing for the whole run.
           mod.bufferFilled = true
           logger:info("[RESTOCK] M" .. mod.index .. " buffer complete, letting it run down")
         end
@@ -1485,6 +1505,81 @@ local function hasPlasma()
     if (brokerState.plasma[name] or 0) > 0 then return true end
   end
   return false
+end
+
+-- ---------------------------------------------------------------------------
+-- FILTER MODE: SHOULD A RUNNING MODULE KEEP ITS ASTEROID?
+--
+-- Under transfer a module runs its load dry, stops, and comes back to dispatch,
+-- which is what lets the fleet follow the needs list. Under filter the bus is
+-- fed for as long as the filters stay set, so a module never runs dry on its
+-- own -- left alone it would mine its first asteroid forever, and every module
+-- would end up parked on whatever it started with.
+--
+-- So each restock pass asks this, and the filters stay only while the answer
+-- is yes. A no clears them; the module runs down and dispatch places it again.
+-- That costs the off/on only when the job actually changes.
+--
+-- The rule mirrors dispatch: needs are served in priority order, one module per
+-- need before any need gets a second. Keep the asteroid while it is still a
+-- need and no higher-priority need is going without a module that only this
+-- one could give it -- i.e. there are not more unserved, reachable needs ahead
+-- of it than idle modules to take them.
+--
+-- A field on brokerState, not a local: restockRunning is above the dispatch
+-- helpers this needs, and the main chunk is at Lua's 200-local ceiling.
+-- Returns true, or false and why.
+-- ---------------------------------------------------------------------------
+brokerState.keepsJob = function(mod)
+  local job = mod.job
+  if not job or not job.asteroid then return false, "no job" end
+
+  local needs = findNeedsList()
+  local myRank
+  for i, need in ipairs(needs) do
+    if need.asteroid == job.asteroid then myRank = i break end
+  end
+  if not myRank then return false, job.asteroid .. " is no longer needed" end
+
+  -- This module's drone counts as free: handing back is exactly what would
+  -- free it, and a need only it can reach must not look unreachable.
+  local drones  = availableDrones()
+  if job.droneKey then drones[job.droneKey] = (drones[job.droneKey] or 0) + 1 end
+  local kits    = availableKits(false)
+  local perLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
+  local function reachable(asteroid)
+    local a = config.asteroids[asteroid]
+    if not a then return false end
+    for key, n in pairs(drones) do
+      local tier = config.droneTierKeys[key]
+      if (n or 0) > 0 and tier and tier >= a.minDrone and tier <= a.maxDrone then
+        local dk = config.droneDrillMap[tier]
+        if dk and (kits[dk] or 0) >= perLoad then return true end
+      end
+    end
+    return false
+  end
+
+  local counts = activeAsteroidCounts()
+  local unserved, seen = 0, {}
+  for i = 1, myRank - 1 do
+    local ast = needs[i].asteroid
+    if not seen[ast] and (counts[ast] or 0) == 0 and reachable(ast) then
+      unserved = unserved + 1
+    end
+    seen[ast] = true
+  end
+  if unserved == 0 then return true end
+
+  -- Counted here rather than via getIdleModules, which also recovers modules
+  -- from ERROR -- a side effect a question must not have.
+  local idle = 0
+  for _, m in ipairs(modules) do
+    if m.dialect and m.status == "IDLE" then idle = idle + 1 end
+  end
+  if unserved <= idle then return true end
+  return false, string.format("%d higher-priority need(s) have no module and %d module(s) are idle",
+    unserved, idle)
 end
 
 -- Dispatch a pinned/reserved module to its fixed asteroid, ignoring dust
