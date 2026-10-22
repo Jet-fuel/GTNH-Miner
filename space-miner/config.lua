@@ -13,7 +13,7 @@ local config = {}
 -- checked-out copy has it beside this file.
 local settings
 do
-  for _, path in ipairs({ "/home/settings.lua", "settings.lua" }) do
+  for _, path in ipairs({ "/home/settings.lua", "settings.lua", "space-miner/settings.lua" }) do
     local ok, mod = pcall(dofile, path)
     if ok and type(mod) == "table" and mod.list then settings = mod break end
   end
@@ -27,7 +27,7 @@ end
 -- the parameter API, so no version spelling is written down in two files.
 local moduleApi
 do
-  for _, path in ipairs({ "/home/module_api.lua", "module_api.lua" }) do
+  for _, path in ipairs({ "/home/module_api.lua", "module_api.lua", "space-miner/module_api.lua" }) do
     local ok, mod = pcall(dofile, path)
     if ok and type(mod) == "table" and mod.mark then moduleApi = mod break end
   end
@@ -682,7 +682,7 @@ config.asteroids = {
     minDist = 25,
     maxDist = 200,
     computation = 360,
-    minModule = 3,
+    minModule = 2,
     baseDuration = 500,
     euPerTick = 122880,
     minDrone = 7,
@@ -899,6 +899,7 @@ config.optimizationMatrix = {
     ["Nickel"]              = { lv = 13, mv = 13, hv = 5, ev = 5, iv = 5 },
     ["Niobium"]             = { iv = 151, luv = 151, zpm = 151, uv = 30, uhv = 30 },
     ["Phosphate"]           = { iv = 241, luv = 241, zpm = 241, uv = 241, uhv = 241, uev = 231, uiv = 231 },
+    ["PlatLine Dust"]       = { zpm = 181, uv = 25, uhv = 25, uev = 25 },
     ["PlatLine Ore"]        = { hv = 13, ev = 13, iv = 13, luv = 13, zpm = 10 },
     ["Quartz"]              = { mv = 101, hv = 101, ev = 101, iv = 25, luv = 25, zpm = 20 },
     ["Salt"]                = { lv = 201, mv = 201, hv = 201, ev = 201, iv = 241 },
@@ -2257,7 +2258,7 @@ config.asteroidOutputs = {
       { item = "Tungstate Dust",                            via = "centrifuge"                 },
     },
   },
-  ["PlatLine Dust"] = {   -- platlinePureAsteroid, drones 6..9, module tier 3
+  ["PlatLine Dust"] = {   -- platlinePureAsteroid, drones 6..9, module tier 2
     drops = {
       { item = "Platinum Dust",                             chance =  3800 },
       { item = "Palladium Dust",                            chance =  2000 },
@@ -2696,11 +2697,12 @@ config.dustTargets = {
   ["Ichorium Dust"]           = { asteroid = "Ichorium", priority = 1 },
   ["Draconic Core"]             = { asteroid = "Draconic Core", priority = 1 },   -- was: Draconic Core Dust -> Draconic Core
   ["Raw Tengam Dust"]         = { asteroid = "Tengam", priority = 1 },
-  -- "PlatLine Dust" was listed here as an item. It is not one: it is the
-  -- asteroid's own name. platlinePureAsteroid uses OrePrefixes.dust over
-  -- Platinum/Palladium/Iridium/Osmium/Ruthenium/Rhodium, and Ruthenium and
-  -- Rhodium are what it yields that PlatLine Ore does not -- neither had an
-  -- entry, so that MK-III asteroid was unreachable.
+  -- platlinePureAsteroid yields Platinum, Palladium, Iridium, Osmium, Ruthenium, Rhodium Dusts.
+  -- Ruthenium and Rhodium are exclusive to PlatLine Dust (MK-II+ module, ZPM+ drones).
+  -- Platinum Dust is also mapped here by default. Palladium, Osmium, and Iridium can be
+  -- mapped here or to PlatLine Ore in the editor.
+  ["Platinum Dust"]           = { asteroid = "PlatLine Dust", priority = 1 },
+  ["PlatLine Dust"]           = { asteroid = "PlatLine Dust", priority = 1 },
   ["Ruthenium Dust"]          = { asteroid = "PlatLine Dust", priority = 1 },
   ["Rhodium Dust"]            = { asteroid = "PlatLine Dust", priority = 2 },
 
