@@ -1150,6 +1150,9 @@ local function tryDispatch(mod, asteroid, droneKey, avail, availKit)
   local droneTier = config.droneTierKeys[droneKey]
   if droneTier < asteroidData.minDrone or droneTier > asteroidData.maxDrone then return false end
 
+  local modTierNum = mod.tier == "MK-III" and 3 or (mod.tier == "MK-II" and 2 or 1)
+  if modTierNum < (asteroidData.minModule or 1) then return false end
+
   local drillKey = config.droneDrillMap[droneTier]
   if not drillKey then return false end
 
