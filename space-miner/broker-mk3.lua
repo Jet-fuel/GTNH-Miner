@@ -2697,6 +2697,13 @@ local function drawStaticFrame()
   -- skipping rows that still hold editor content.
   dashInvalidate()
   term.clear()
+  -- The terminal cursor blinks by saving the character under it and writing it
+  -- back. The dashboard draws with gpu.set, which the terminal never sees, so
+  -- wherever the cursor was last left -- after a setCursor/io.write below, or a
+  -- prompt before the dashboard started -- it kept restoring a stale letter on
+  -- top of the fresh frame. That was the stray d / h / I / E. Nothing on the
+  -- dashboard reads input through the terminal, so the blink can simply go.
+  term.setCursorBlink(false)
   gpu.setForeground(0x00FF00)
   gpu.fill(1, 1, W, 1, "="); gpu.fill(1, 5, W, 1, "=")
   term.setCursor(2, 2); gpu.setForeground(0xFFFFFF); io.write("MEDINA BROKER MK3  (v1.5)")
@@ -3482,6 +3489,8 @@ local ok, err = xpcall(mainLoop, debug.traceback)
 pcall(shutdown)
 
 if gpu then pcall(function() gpu.setForeground(0xFFFFFF) end) end
+-- Back to the shell's normal cursor; the dashboard turned it off.
+pcall(term.setCursorBlink, true)
 if ok then
   logger:info("clean shutdown")
   print("Broker stopped. All modules gated off.")
