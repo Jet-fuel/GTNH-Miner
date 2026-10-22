@@ -5,6 +5,37 @@
 
 local config = {}
 
+-- The tunable registry. Every scalar knob in the system is declared there, with
+-- its type and legal range, and this file is one of three readers -- the broker's
+-- settings page and the telemetry nodes are the others.
+--
+-- Two paths because the install puts everything in /home, while running from a
+-- checked-out copy has it beside this file.
+local settings
+do
+  for _, path in ipairs({ "/home/settings.lua", "settings.lua", "space-miner/settings.lua" }) do
+    local ok, mod = pcall(dofile, path)
+    if ok and type(mod) == "table" and mod.list then settings = mod break end
+  end
+  if not settings then
+    error("config.lua: cannot load settings.lua -- re-run install-medina to fetch it")
+  end
+end
+
+-- Same two paths, and for the same reason. Needed to build the drone labels in
+-- §14b -- module_api owns every 2.8/2.9 difference, the label form along with
+-- the parameter API, so no version spelling is written down in two files.
+local moduleApi
+do
+  for _, path in ipairs({ "/home/module_api.lua", "module_api.lua", "space-miner/module_api.lua" }) do
+    local ok, mod = pcall(dofile, path)
+    if ok and type(mod) == "table" and mod.mark then moduleApi = mod break end
+  end
+  if not moduleApi then
+    error("config.lua: cannot load module_api.lua -- re-run install-medina to fetch it")
+  end
+end
+
 -- Helper: convert k/m/b suffixes to numbers (e.g. 100k=100000, 1m=1000000, 1b=1000000000)
 local function qty(s)
   if type(s) == "number" then return s end
@@ -24,26 +55,43 @@ end
 
 --------------------------------------------------------------------------------
 -- 1. DRONE REGISTRY
--- Maps short tier keys (lv, mv, ... uxv) to the exact item name as reported
--- by the ME network. Used by hw_telem for inventory scanning and by job_node
--- when requesting items via transposer.
+-- Maps short tier keys (lv, mv, ... max) to the exact item name as reported by
+-- the ME network. Used by hw_telem for inventory scanning and by the loader
+-- when fingerprinting items for the transposer.
+--
+-- THE PARTS ARE WRITTEN DOWN; THE LABEL IS NOT. A drone label is a roman tier
+-- and a voltage, and how those are spelled depends on the pack: 2.8 is
+-- "Mining Drone MK-IX", 2.9 is "Mining Drone Mk-IX (UHV)". §14b builds
+-- config.drones from these once gtVersion is known -- which cannot happen here,
+-- three thousand lines before the user overlay is merged.
+--
+-- This used to be a table of literal 2.8 strings that §14b rewrote in place,
+-- and that only worked while the marker was the sole difference. It is not:
+-- dropping " (UHV)" for 2.8 throws the voltage away, so a string rewrite cannot
+-- go back. Read config.drones, and see module_api.lua for why the version is
+-- configured rather than probed.
 --------------------------------------------------------------------------------
-config.drones = {
-  lv  = "Mining Drone MK-I (LV)",
-  mv  = "Mining Drone MK-II (MV)",
-  hv  = "Mining Drone MK-III (HV)",
-  ev  = "Mining Drone MK-IV (EV)",
-  iv  = "Mining Drone MK-V (IV)",
-  luv = "Mining Drone MK-VI (LuV)",
-  zpm = "Mining Drone MK-VII (ZPM)",
-  uv  = "Mining Drone MK-VIII (UV)",
-  uhv = "Mining Drone MK-IX (UHV)",
-  uev = "Mining Drone MK-X (UEV)",
-  uiv = "Mining Drone MK-XI (UIV)",
-  umv = "Mining Drone MK-XII (UMV)",
-  uxv = "Mining Drone MK-XIII (UXV)",
-  max = "Mining Drone MK-XIV (MAX)"
+config.droneTiers = {
+  lv  = { roman = "I",    volt = "LV"  },
+  mv  = { roman = "II",   volt = "MV"  },
+  hv  = { roman = "III",  volt = "HV"  },
+  ev  = { roman = "IV",   volt = "EV"  },
+  iv  = { roman = "V",    volt = "IV"  },
+  luv = { roman = "VI",   volt = "LuV" },
+  zpm = { roman = "VII",  volt = "ZPM" },
+  uv  = { roman = "VIII", volt = "UV"  },
+  uhv = { roman = "IX",   volt = "UHV" },
+  uev = { roman = "X",    volt = "UEV" },
+  uiv = { roman = "XI",   volt = "UIV" },
+  umv = { roman = "XII",  volt = "UMV" },
+  uxv = { roman = "XIII", volt = "UXV" },
+  max = { roman = "XIV",  volt = "MAX" }
 }
+
+-- Filled by config.setGtVersion() in §14b. Empty here on purpose: a placeholder
+-- spelling would be one more thing that could be read by accident and be wrong
+-- on exactly the pack this table exists to get right.
+config.drones = {}
 
 -- Iteration order for best-available drone selection (highest tier first).
 -- Broker walks this list and picks the first tier that is both in stock
@@ -87,65 +135,6 @@ config.drills = {
   cosmicNeutronium  = { tip = "Cosmic Neutronium Drill Tip", rod = "Cosmic Neutronium Rod" },
   infinity          = { tip = "Infinity Drill Tip", rod = "Infinity Rod" },
   transcendentMetal = { tip = "Transcendent Metal Drill Tip", rod = "Transcendent Metal Rod" }
-}
-
---------------------------------------------------------------------------------
--- 2b. ITEM REGISTRY (internal names for db.set)
--- GTNH 2.9 broke iface.store(); we now write fingerprints via db.set(slot,
--- registryName, damage). These tables map config keys to the Minecraft internal
--- item name + damage value. Scan new items with scan_items.lua to get values.
---------------------------------------------------------------------------------
-config.droneRegistry = {
-  lv  = { name = "gtnhintergalactic:item.MiningDrone", damage = 0 },
-  mv  = { name = "gtnhintergalactic:item.MiningDrone", damage = 1 },
-  hv  = { name = "gtnhintergalactic:item.MiningDrone", damage = 2 },
-  ev  = { name = "gtnhintergalactic:item.MiningDrone", damage = 3 },
-  iv  = { name = "gtnhintergalactic:item.MiningDrone", damage = 4 },
-  luv = { name = "gtnhintergalactic:item.MiningDrone", damage = 5 },
-  zpm = { name = "gtnhintergalactic:item.MiningDrone", damage = 6 },
-  uv  = { name = "gtnhintergalactic:item.MiningDrone", damage = 7 },
-  uhv = { name = "gtnhintergalactic:item.MiningDrone", damage = 8 },
-  uev = { name = "gtnhintergalactic:item.MiningDrone", damage = 9 },
-  uiv = { name = "gtnhintergalactic:item.MiningDrone", damage = 10 },
-  umv = { name = "gtnhintergalactic:item.MiningDrone", damage = 11 },
-  uxv = { name = "gtnhintergalactic:item.MiningDrone", damage = 12 },
-  max = { name = "gtnhintergalactic:item.MiningDrone", damage = 13 },
-}
-
-config.drillRegistry = {
-  steel         = {
-    tip = { name = "gregtech:gt.metaitem.02", damage = 8305 },
-    rod = { name = "gregtech:gt.metaitem.01", damage = 23305 }
-  },
-  titanium      = {
-    tip = { name = "gregtech:gt.metaitem.02", damage = 8028 },
-    rod = { name = "gregtech:gt.metaitem.01", damage = 23028 }
-  },
-  tungstensteel = {
-    tip = { name = "gregtech:gt.metaitem.02", damage = 8316 },
-    rod = { name = "gregtech:gt.metaitem.01", damage = 23316 }
-  },
-  naquadah      = {
-    tip = { name = "gregtech:gt.metaitem.02", damage = 8324 },
-    rod = { name = "gregtech:gt.metaitem.01", damage = 23324 }
-  },
-  naquadahAlloy = {
-    tip = { name = "gregtech:gt.metaitem.02", damage = 8325 },
-    rod = { name = "gregtech:gt.metaitem.01", damage = 23325 }
-  },
-  neutronium    = {
-    tip = { name = "gregtech:gt.metaitem.02", damage = 8129 },
-    rod = { name = "gregtech:gt.metaitem.01", damage = 23129 }
-  },
-  -- Missing: cosmicNeutronium, infinity, transcendentMetal.
-  --
-  -- This does NOT hold back those tiers. Nothing reads this table any more --
-  -- the loader resolves items by LABEL via iface.store(), and tryDispatch()
-  -- gates on config.drills, which has all nine materials. Tiers 11-14 dispatch
-  -- and load fine without an entry here.
-  --
-  -- Kept because a fingerprint-based loader would need it again, but treat it
-  -- as reference data, not as the list of what works.
 }
 
 -- Maps drone tier number to the drill key in config.drills above.
@@ -203,19 +192,6 @@ config.plasmas = {
 config.plasmaKeyOrder = {
   "Plutonium 241 Plasma", "Technetium Plasma", "Radon Plasma",
   "Bismuth Plasma", "Helium Plasma"
-}
-
---------------------------------------------------------------------------------
--- 5. CYCLE MODE DEFAULTS
--- Used when a job_node sets mode=1 (dynamic distance sweep) on a module.
--- In cycle mode the module sweeps distances between (distance - range) and
--- (distance + range), incrementing by step each pass, harvesting a wider
--- spread of asteroid types. Static mode (mode=0) locks to one distance.
---------------------------------------------------------------------------------
-config.cycleDefaults = {
-  defaultMode  = 0,
-  defaultRange = 50,
-  defaultStep  = 20
 }
 
 --------------------------------------------------------------------------------
@@ -706,7 +682,7 @@ config.asteroids = {
     minDist = 25,
     maxDist = 200,
     computation = 360,
-    minModule = 3,
+    minModule = 2,
     baseDuration = 500,
     euPerTick = 122880,
     minDrone = 7,
@@ -923,6 +899,7 @@ config.optimizationMatrix = {
     ["Nickel"]              = { lv = 13, mv = 13, hv = 5, ev = 5, iv = 5 },
     ["Niobium"]             = { iv = 151, luv = 151, zpm = 151, uv = 30, uhv = 30 },
     ["Phosphate"]           = { iv = 241, luv = 241, zpm = 241, uv = 241, uhv = 241, uev = 231, uiv = 231 },
+    ["PlatLine Dust"]       = { zpm = 181, uv = 25, uhv = 25, uev = 25 },
     ["PlatLine Ore"]        = { hv = 13, ev = 13, iv = 13, luv = 13, zpm = 10 },
     ["Quartz"]              = { mv = 101, hv = 101, ev = 101, iv = 25, luv = 25, zpm = 20 },
     ["Salt"]                = { lv = 201, mv = 201, hv = 201, ev = 201, iv = 241 },
@@ -2281,7 +2258,7 @@ config.asteroidOutputs = {
       { item = "Tungstate Dust",                            via = "centrifuge"                 },
     },
   },
-  ["PlatLine Dust"] = {   -- platlinePureAsteroid, drones 6..9, module tier 3
+  ["PlatLine Dust"] = {   -- platlinePureAsteroid, drones 6..9, module tier 2
     drops = {
       { item = "Platinum Dust",                             chance =  3800 },
       { item = "Palladium Dust",                            chance =  2000 },
@@ -2720,11 +2697,12 @@ config.dustTargets = {
   ["Ichorium Dust"]           = { asteroid = "Ichorium", priority = 1 },
   ["Draconic Core"]             = { asteroid = "Draconic Core", priority = 1 },   -- was: Draconic Core Dust -> Draconic Core
   ["Raw Tengam Dust"]         = { asteroid = "Tengam", priority = 1 },
-  -- "PlatLine Dust" was listed here as an item. It is not one: it is the
-  -- asteroid's own name. platlinePureAsteroid uses OrePrefixes.dust over
-  -- Platinum/Palladium/Iridium/Osmium/Ruthenium/Rhodium, and Ruthenium and
-  -- Rhodium are what it yields that PlatLine Ore does not -- neither had an
-  -- entry, so that MK-III asteroid was unreachable.
+  -- platlinePureAsteroid yields Platinum, Palladium, Iridium, Osmium, Ruthenium, Rhodium Dusts.
+  -- Ruthenium and Rhodium are exclusive to PlatLine Dust (MK-II+ module, ZPM+ drones).
+  -- Platinum Dust is also mapped here by default. Palladium, Osmium, and Iridium can be
+  -- mapped here or to PlatLine Ore in the editor.
+  ["Platinum Dust"]           = { asteroid = "PlatLine Dust", priority = 1 },
+  ["PlatLine Dust"]           = { asteroid = "PlatLine Dust", priority = 1 },
   ["Ruthenium Dust"]          = { asteroid = "PlatLine Dust", priority = 1 },
   ["Rhodium Dust"]            = { asteroid = "PlatLine Dust", priority = 2 },
 
@@ -2859,34 +2837,10 @@ config.dustTargets = {
 }
 
 --------------------------------------------------------------------------------
--- 9. MODULE ITEM FILTER BLACKLIST
--- High-volume junk ores that clog the ME output bus with no useful yield.
--- Load these into each mining module's built-in filter as a blacklist.
--- End-dimension variants of common ores are particularly prolific and
--- should always be excluded.
---------------------------------------------------------------------------------
-config.blacklist = {
-  "Cheese Ore",
-  "Oilsands Ore",
-  "Fluorspar Ore",
-  "End Copper Ore",
-  "End Malachite Ore",
-  "End Chalcopyrite Ore",
-  "End Iron Ore",
-  "End Pyrite Ore",
-  "End Basaltic Mineral Sand Ore",
-  "End Granitic Mineral Sand Ore",
-  "End Coal Ore",
-  "End Lignite Coal Ore"
-}
-
---------------------------------------------------------------------------------
 -- 10. DUST STOCK THRESHOLDS
 -- Target quantities to maintain in the dust storage ME subnet.
 -- Broker triggers a mining job when stock < amountToMaintain.
 -- Asteroid is resolved via dustTargets[itemName].asteroid.
--- After each job run the broker waits config.pipelineCheckDelay seconds
--- for the ore processing pipeline to catch up before re-evaluating.
 --------------------------------------------------------------------------------
 config.conditions = {
   --  { itemName = "Ichorium Dust",           amountToMaintain = qty("5m")  },
@@ -2938,365 +2892,161 @@ config.conditions = {
 }
 
 --------------------------------------------------------------------------------
--- 11. NETWORK & RUNTIME SETTINGS
+-- 11. PORTS
+--
+-- Ports live here. Every OTHER tunable is declared in settings.lua and edited in
+-- game -- press E on the broker, then g. SETTINGS.md explains what each one does
+-- and why it ships the way it does.
+--
+-- Ports stay out of the editor deliberately: changing one from inside the broker
+-- would disconnect the fleet from the machine doing the changing, and the packet
+-- telling the nodes about the new number would go out on it.
+--
+-- The telemetry nodes load no config at all, so each carries its own copy at the
+-- top of its script. Four files hold these numbers and they must agree:
+-- config.lua, dust_telem.lua, fluid_telem.lua and hw_telem.lua. Change one alone
+-- and that node simply stops hearing the broker -- its dashboard shows a
+-- settings source stuck on "defaults", and for hw_telem, drill auto-crafting
+-- silently stops.
 --------------------------------------------------------------------------------
 config.ports = {
-  telemetry = 2026, -- inbound to broker: telem nodes + job nodes → broker
-  command   = 2027, -- outbound from broker: broker → job nodes
-  hardware  = 2025  -- outbound from broker: broker → hw telem node
+  telemetry = 2026, -- inbound to broker: telem nodes + job nodes -> broker
+  command   = 2027, -- outbound from broker: broker -> dust and fluid nodes
+  hardware  = 2025  -- outbound from broker: broker -> hw telem node
 }
--- Why the hardware node gets its own port instead of listening on `command`:
--- the DUST_WATCHLIST broadcast carries every tracked dust item, and the hw node
--- is the most memory-constrained machine in the fleet (it does not even load
--- this file). Sharing a port would make it unserialize that packet every 30s
--- only to discard it. 2025 was already opened by hw_telem for a query protocol
--- that never got a client, so this costs nothing new.
---
--- NOTE: hw_telem.lua hardcodes 2025 -- it does not load this file. Changing the
--- number here without changing it there silently stops drill auto-crafting.
 
--- Seconds to wait after a job run before re-checking dust levels.
--- Accounts for ore processing pipeline delay (ore → ore factory → dust storage).
-config.pipelineCheckDelay = 30
+--------------------------------------------------------------------------------
+-- 12. TUNABLES
+--
+-- Seeded from the declarations in settings.lua. Two views of the same values:
+--
+--   config.settings   the STORED form -- what user_config.lua carries and what
+--                     the editor round-trips. `asteroidCap` is "auto" here.
+--   config.<key>      the RUNTIME form the rest of the system reads, which is
+--                     what it read before this file was split up. `asteroidCap`
+--                     is nil here. The two differ only where a declaration
+--                     provides an `apply`.
+--
+-- config.shippedSettings is the pre-overlay snapshot, so the editor can save
+-- only what you actually changed rather than freezing every default.
+--------------------------------------------------------------------------------
+-- The registry itself, so the broker's settings page validates edits against
+-- exactly the declarations this file was seeded from rather than loading its
+-- own second copy.
+config.settingsSpec = settings
 
--- How many modules may work the same asteroid at once.
---
---   nil     automatic (default): half the modules plus one while SEVERAL
---           asteroids are wanted, and no limit at all when only one is -- the
---           cap divides the fleet between competing needs, and with a single
---           target there is nothing to divide and nothing to protect.
---   <n>     pin it to n modules.
---   "all"   never limit; one asteroid may take the whole fleet.
---
--- Raise or pin this only if you want a specific split. Lowering it idles
--- modules, which only helps when you are deliberately reserving capacity.
-config.asteroidCap = nil
+config.settings = settings.defaults(config)
 
--- How many drill tips and rods to stock per module load, in ITEMS.
---
--- These are totals across the input bus, not per slot. A slot holds one stack
--- (64), so anything above that is spread over additional bus slots -- slot 1 is
--- the drone, and tips and rods fill from slot 2 onwards. The bus needs enough
--- free slots for the total you ask for, and the loader stops filling when it
--- runs out of room rather than failing.
---
--- 128 is two stacks each, which halves how often a module stops to reload. Drop
--- back to 64 if a module ever refuses to run with consumables spread over more
--- than one slot.
---
--- The broker will not dispatch unless at least this many kits are in stock, so
--- raising it also raises the dispatch floor -- keep config.drillPar comfortably
--- above it.
-config.tipsPerLoad = 128
-config.rodsPerLoad = 128
+config.shippedSettings = {}
+for k, v in pairs(config.settings) do config.shippedSettings[k] = v end
 
--- How much has to be in the bus before the module STARTS. The rest of the
--- buffer above is filled while it is already mining.
+--------------------------------------------------------------------------------
+-- 13. DRILL RESTOCK PAR
 --
--- Waiting for the full 128 of each meant 256 items through the ME before a drill
--- that was ready to work would turn on, and six modules do that at once. One
--- stack is one interface configuration slot, which is the fastest delivery the
--- ME can make.
+-- Per-material stock floors the hw telemetry node auto-crafts back up to.
+-- Edited on the editor's drills page; see SETTINGS.md for what the numbers mean
+-- and what the top three tiers cost to keep at par.
 --
--- Set these equal to tipsPerLoad/rodsPerLoad to go back to filling completely
--- before starting.
-config.tipsToStart = 64
-config.rodsToStart = 64
-
--- How long after a module starts the broker may keep finishing its buffer.
+--   tips / rods  the stock FLOOR -- fall below it and a craft is requested.
+--   batch        the REQUEST SIZE -- always sent whole, never the shortfall.
 --
--- Only unpinned modules use this, and only until the buffer is complete. It is
--- a backstop: without it, a module the ME cannot supply would be topped up for
--- its entire run, and a module that is always topped up never runs dry, never
--- reaches DONE, and is never re-dispatched -- which quietly pins it to whatever
--- asteroid it first picked up. Pinned modules top up forever by design.
-config.topUpWindow = 30
-
--- FAST RELOAD -- skip the unload when the next job wants the same hardware.
---
--- A finished module has consumed its tips and rods -- running out is what makes
--- it stop -- so the only thing left in the bus is the drone. And most
--- re-dispatches send the module back to the same asteroid, wanting that same
--- drone. Returning it to the network, waiting for the network to absorb it, and
--- then asking for it back is a round trip per cycle that ends where it started.
--- The wait for the network to absorb it is the `pre` phase on the module line.
---
--- With this on, a finished module HOLDS the drone and dispatch decides. Same
--- drone -> keep it, fetch consumables fresh, restart. Different -> return it
--- exactly as before.
---
--- holdTimeout returns the contents if nothing claims the module, since a held
--- drone is invisible to every other module until it is given back. Dispatch
--- normally claims it within a fraction of a second.
---
--- Off by default: it is the most invasive change to the load path, and the
--- failure mode if the broker is wrong about what a module holds would be arming
--- a module with the wrong hardware. The loader verifies the drone before
--- committing, so that should fail loudly rather than silently -- but prove it on
--- your setup before leaving it on.
--- How long a load waits for the ME to take back what was just returned before
--- loading anyway. It is a courtesy -- giving the network room to deliver into --
--- not a correctness requirement, because the loader matches items by label
--- rather than by slot. It used to wait 15s and then FAIL the load, which on a
--- recipe change with a busy network cost a module an ERROR and a cooldown.
-config.preDrainWait = 2.0
-
-config.fastReload  = false
-config.holdTimeout = 10
-
--- Charge a drone and a full load of kits for EVERY working module.
---
--- Dispatch works from a pool of what is free right now: telemetry reports what
--- the staging ME holds, and commitments the last sweep could not have seen yet
--- are subtracted by hand. A module that has been mining long enough for a sweep
--- to run is NOT subtracted, because the ME no longer lists its drone -- charging
--- it again would count the same drone twice.
---
--- That trusts telemetry to be current. Turn this on and the trust goes away: a
--- working module costs its drone and its tipsPerLoad/rodsPerLoad of kits for as
--- long as it is working, whatever the ME says. Nothing in stock can be promised
--- to two modules on the strength of a stale sweep.
---
--- The price is a standing spare per busy module -- five modules mining means
--- five drones held out of the pool -- and, if commitments ever outnumber
--- reported stock, a pool that goes negative and stops dispatching that tier
--- entirely. That is the failure this was conditionalised to fix, so it is off
--- by default.
---
--- Turn it on if you do not trust the hw node's figures, or if you have watched
--- two modules argue over one physical drone.
---
--- A module blocked this way does not idle: dispatch moves on to the next need,
--- so it takes a different asteroid it CAN reach rather than waiting.
-config.reserveWhileMining = false
-
--- How many modules may be LOADING at the same time. 0 = no limit.
---
--- Loads do not really run in parallel: they share one computer's component-call
--- budget, which OpenComputers meters at roughly one indirect call per tick.
--- Measured in game, a module loading alone took 3 seconds and the same load
--- alongside five siblings took 22-30 -- the work was not slower, it was queued.
---
--- Since the total budget is the same either way, staggering means early modules
--- start mining sooner and the last one is no worse off.
---
--- Set to 0 (no limit) because the reason for the cap has since gone away. Loads
--- were ~90 metered calls each when it was introduced; after the loader and the
--- restock path stopped reading inventories one slot at a time they are ~39, and
--- six at once now finish in 2-7s rather than 22-37s. Staggering cheap loads only
--- delays the modules waiting for a slot.
---
--- Put it back to 2 or 3 if load times climb again -- that would mean something
--- has started competing for the call budget once more.
-config.maxConcurrentLoads = 0
-
--- How often to ask a running module whether it has finished.
---
--- Each check is a component call, so a constant fast rate is expensive: nine
--- modules at four checks a second spend 36 calls a second on a question that is
--- answered "no" for nearly the whole run, competing with the loads for the same
--- budget.
---
--- The broker learns how long each module runs for (it stops when consumables
--- run out, so this is very consistent) and checks lazily until the end is near.
---
--- Run length is not constant -- a recipe cycle varies from a few seconds to
--- fifteen, and a run is several cycles -- so the broker does not try to predict
--- when a run will end. It remembers the SHORTEST run each module has done for
--- its current asteroid, drill and parallel count, and checks lazily only within
--- a fraction of that: a window the module has demonstrably never finished in.
---
---   runPollIdle      seconds between checks inside that safe window.
---                    0 = check at the fast rate throughout, the old behaviour.
---   runSafeFraction  how much of the shortest observed run counts as safe.
---                    Lower is more cautious and costs more calls.
---
--- Measured across six modules, poll rate against worst-case detection lag:
---
---   3.0    8.2 calls/s   2.41s
---   2.0    8.9           2.32s
---   1.5    9.6           1.38s   <- the knee, and the default
---   1.0   11.1           1.51s
---   0.25  23.9           0.76s   (constant fast polling)
---
--- 1.5 nearly halves the worst case against 3.0 for 1.4 extra calls a second.
--- Going all the way to constant costs another fourteen for 0.6s.
-config.runPollIdle     = 1.5
-config.runSafeFraction = 0.8
-
--- Par levels for drill consumables. The broker publishes this table to the hw
--- telem node (DRILL_PAR on config.ports.hardware); the node compares it against
--- its own live ME scan and auto-crafts anything below par.
---
--- Only materials listed here are ever ordered -- an explicit list, so adding a
--- drill material to the game does not silently start an expensive craft.
---
--- All nine are listed because all nine are dispatchable: the gate in
--- tryDispatch() is config.drills, which has every material. (config.drillRegistry
--- looks like it gates this but is dead -- nothing reads it since the loader moved
--- to label-based lookup. Do not use it to decide what belongs here.) A tier left
--- out of this table still dispatches and still burns kits; it just never gets
--- restocked, which is the silent stall this whole feature exists to remove.
---
--- Be aware what the top three cost. 256 Infinity or Transcendent Metal drill
--- tips is a large unattended resource commitment. Lower those pars, or drop them
--- to false in user_config.lua, if you would rather approve those crafts by hand.
---
--- Levels are scaled to what each material costs to make rather than held flat.
--- A flat number is wrong at both ends: a shallow buffer of Steel is nothing on
--- a mature base, while the same figure in Transcendent Metal is an enormous
--- unattended craft.
---
--- Two numbers per material, and they do different jobs:
---
---   tips / rods  the stock FLOOR. Fall below it and a craft is requested.
---   batch        the REQUEST SIZE. Always sent whole, never the shortfall.
---
--- Requesting the exact shortfall meant a material sitting just under its floor
--- produced a trickle -- ask for 4096, be 196 short, order 196. Ordering a full
--- batch instead means every request is worth the crafting CPU it occupies.
---
--- The trade is overshoot: floor 4096 with batch 4096 means stock at 4095 orders
--- another 4096 and lands near 8191 before settling. Lower the batch if you would
--- rather hold less, or lower the floor if you would rather craft less often.
---
--- Values are in ITEMS. One module refill is config.tipsPerLoad of each, which
--- ships at 128, so 4096 is 32 refills. How long a refill lasts depends on the
--- module: the recipe burns 4 tips and 4 rods per parallel per cycle, and
--- maxParallels is 2/4/8 for MK-I/II/III -- so on an MK-II a refill covers 8
--- cycles, making 4096 roughly 256 cycles of buffer.
---
--- (This paragraph said 64 and "4 cycles" while tipsPerLoad was already 128, so
--- every number derived from it was out by half.)
---
--- Keep every floor at or above 64 or a module can stall on the kits < 64
--- dispatch floor while nominally sitting at par.
---
--- If the network has no crafting pattern for a listed item, the node reports it
--- as "nopattern" and it shows up red on both dashboards -- a missing pattern is
--- meant to be loud, since the failure it replaces (a module that silently never
--- loads) is the hardest thing in this system to diagnose.
+-- Only materials listed here are ever ordered. A tier left out still dispatches
+-- and still burns kits; it just never restocks.
+--------------------------------------------------------------------------------
 config.drillPar = {
-  -- tips/rods = the stock floor: drop below it and a craft is requested.
-  -- batch     = how many are requested when that happens, for tips and rods
-  --             alike. It is NOT the shortfall -- a full batch goes out even if
-  --             you are only a few short, so requests are always worth making.
   steel             = { tips = 4096, rods = 4096, batch = 4096 },
   titanium          = { tips = 4096, rods = 4096, batch = 4096 },
   tungstensteel     = { tips = 4096, rods = 4096, batch = 4096 },
   naquadah          = { tips = 2048, rods = 2048, batch = 2048 },
   naquadahAlloy     = { tips = 2048, rods = 2048, batch = 2048 },
   neutronium        = { tips = 1024, rods = 1024, batch = 1024 },
-  -- Tiers 11-14 (MK-XI UIV and up). Held low deliberately: these are the ones
-  -- where an unattended craft is genuinely expensive, and par is only published
-  -- once you own a drone that uses them anyway.
   cosmicNeutronium  = { tips =  256, rods =  256, batch =  256 },
   infinity          = { tips =  256, rods =  256, batch =  256 },
   transcendentMetal = { tips =  256, rods =  256, batch =  256 },
 }
 
--- How many drill crafts the hw node may have in flight at once.
---
--- Match this to your AE2 crafting CPUs in the staging network. AE2 cancels a
--- request outright when no CPU is free, so firing every shortfall at once on a
--- one-CPU network means one craft starts and the rest come back rejected --
--- which read as hard failures on both dashboards and re-fired every retry.
--- Shortfalls beyond this limit wait quietly as "queued" instead.
---
--- Setting this HIGHER than your CPU count is the failure mode to avoid: the
--- surplus requests are rejected on arrival and show as REJECTED. Setting it
--- lower only makes restocking slower, so when in doubt round down.
-config.drillCraftSlots = 2
-
--- ---------------------------------------------------------------------------
--- LOGGING (see logger.lua)
--- Disabled by default: ERROR/WARN lines still go to the log file so you can
--- diagnose problems, but nothing spams the screen and nothing hits the network.
--- Set enabled = true to also capture INFO/DEBUG, or to use the loki/console
--- backends.
--- ---------------------------------------------------------------------------
-config.logging = {
-  enabled      = false,  -- master switch
-  backend      = "file", -- "file" | "console" | "loki"
-  file         = "/tmp/spacemining.log",
-  maxFileBytes = 65536,  -- log file is capped at this size
-  -- Only used when backend == "loki":
-  lokiHost     = "127.0.0.1",
-  lokiPort     = 3100,
-  -- Optional: set a real Unix epoch (seconds) to anchor timestamps if you have
-  -- a way to fetch it; otherwise timestamps are uptime-relative.
-  bootUnixTime = 0,
-}
-
 --------------------------------------------------------------------------------
--- USER OVERLAY
+-- 14. USER OVERLAY
 --
 -- Everything above this line is SHIPPED data: hand-maintained tables plus the
--- generated asteroidOutputs block. It gets regenerated and updated wholesale,
--- so nothing you change in game may live here -- it would be overwritten the
--- next time this file is refreshed.
+-- generated asteroidOutputs block. It gets regenerated wholesale, so nothing you
+-- change in game may live here -- it would be overwritten by the next update.
 --
--- Your choices live in /home/user_config.lua instead, which only the in-game
--- editor (press E on the broker) ever writes. One writer per file, so the two
--- can never clobber each other.
+-- Your choices live in /home/user_config.lua, which only the in-game editor ever
+-- writes. One writer per file, so the two can never clobber each other. The
+-- overlay is optional; with no user_config.lua the shipped defaults are used.
 --
--- The overlay is optional. With no user_config.lua present the shipped
--- defaults are used exactly as before.
+-- Merge rules are documented in SETTINGS.md. In short: conditions is REPLACED,
+-- everything else is MERGED per entry, so anything you have not touched keeps
+-- following updates to this file.
 --
---   conditions   REPLACED by yours if present -- what you track is entirely
---                your call, not something a shipped default should fight.
---   dustTargets  MERGED over the shipped table, so new mappings you add are
---                added and existing ones can be corrected, while everything you
---                have not touched keeps following updates to this file.
---   drillPar     MERGED per material, same reasoning: a par you tuned for one
---                drill wins, while the materials you never touched keep
---                following the shipped defaults. Set a material to false to
---                stop ordering it entirely.
---   drillLoad    MERGED per field, over tipsPerLoad / rodsPerLoad /
---                tipsToStart / rodsToStart / drillCraftSlots. Same reasoning
---                again: a field you set wins, the rest follow this file.
+-- Snapshots are taken BEFORE merging so the editor can tell a shipped entry from
+-- one of yours and persist only the latter. Without them it would have to write
+-- all 100-odd mappings back out, freezing them and masking every future
+-- correction.
 --------------------------------------------------------------------------------
 
--- Snapshot before merging so the editor can tell which entries are genuinely
--- yours and only persist those. Without this it could not distinguish a shipped
--- mapping from one you added, and would have to write all 100-odd back out --
--- freezing them and masking every future correction.
 config.shippedDustTargets = {}
 for item, t in pairs(config.dustTargets) do
   config.shippedDustTargets[item] = { asteroid = t.asteroid, priority = t.priority }
 end
 
--- Same snapshot, same reason, for the two drill tables the editor can write.
 config.shippedDrillPar = {}
 for key, p in pairs(config.drillPar) do
   config.shippedDrillPar[key] = { tips = p.tips, rods = p.rods, batch = p.batch }
 end
 
--- The fields the editor's drill page can move. Named in one place so the
--- overlay, the snapshot and the editor cannot drift apart.
-config.drillLoadFields = {
-  "tipsPerLoad", "rodsPerLoad", "tipsToStart", "rodsToStart", "drillCraftSlots"
-}
-
-config.shippedDrillLoad = {}
-for _, k in ipairs(config.drillLoadFields) do config.shippedDrillLoad[k] = config[k] end
+-- Anything the overlay asked for that could not be honoured. Surfaced by the
+-- broker at boot rather than swallowed: a user_config.lua written by a newer
+-- version, or hand-edited into an illegal value, should say so and carry on
+-- with the default -- not stop the fleet, and not silently ignore you.
+config.settingsRejected = {}
 
 do
   local ok, user = pcall(dofile, "/home/user_config.lua")
   if ok and type(user) == "table" then
+    if type(user.settings) == "table" then
+      config.settingsRejected =
+        settings.merge(config, config.settings, user.settings)
+    end
+
+    -- drillLoad predates the settings registry: five scalars in their own
+    -- table. Read it so an upgrade does not silently drop tuning, and let
+    -- `settings` win where both name the same field -- the editor writes
+    -- `settings` now, so a value in both means drillLoad is the stale copy.
+    if type(user.drillLoad) == "table" then
+      local legacy = {}
+      for k, v in pairs(user.drillLoad) do
+        if user.settings == nil or user.settings[k] == nil then legacy[k] = v end
+      end
+      settings.merge(config, config.settings, legacy)
+    end
+
     if type(user.dustTargets) == "table" then
       for item, t in pairs(user.dustTargets) do
         config.dustTargets[item] = { asteroid = t.asteroid, priority = t.priority }
       end
     end
-    if type(user.conditions) == "table" and #user.conditions > 0 then
+
+    -- ABSENT means "follow the shipped list"; PRESENT means "this is the list",
+    -- including when it is empty.
+    --
+    -- The `> 0` test that used to be here conflated the two, so unticking the
+    -- last item in the editor saved an empty list and then silently got all
+    -- hundred shipped conditions back on the next boot -- with the editor still
+    -- showing nothing tracked. "Stock nothing" is a legitimate thing to want
+    -- (a base pinning every module to one asteroid by hand, say), and it was
+    -- the one setting the editor could not express.
+    if type(user.conditions) == "table" then
       config.conditions = user.conditions
     end
+
     if type(user.drillPar) == "table" then
       for key, p in pairs(user.drillPar) do
-        -- `false` is how you switch a shipped material off. Writing nil into a
-        -- table you are iterating elsewhere is fine here, but false would leak
-        -- through to the broadcast as a non-table, so drop the key outright.
+        -- `false` is how you switch a shipped material off. Drop the key
+        -- outright rather than storing false, which would leak through to the
+        -- DRILL_PAR broadcast as a non-table the node would have to defend
+        -- against.
         if p == false then
           config.drillPar[key] = nil
         elseif type(p) == "table" then
@@ -3304,19 +3054,69 @@ do
         end
       end
     end
-    -- Scalars rather than a table, so they merge field by field.
-    --
-    -- The >= 1 guard is not tidiness. A zero tipsPerLoad would send modules out
-    -- with nothing to drill with, and a zero drillCraftSlots would stop every
-    -- restock without saying anything -- both of which look like hardware faults
-    -- from the dashboard.
-    if type(user.drillLoad) == "table" then
-      for _, k in ipairs(config.drillLoadFields) do
-        local v = user.drillLoad[k]
-        if type(v) == "number" and v >= 1 then config[k] = math.floor(v) end
-      end
-    end
   end
+end
+
+--------------------------------------------------------------------------------
+-- 14b. DRONE LABELS FOR THIS PACK VERSION
+--
+-- Has to run HERE, after the overlay: gtVersion is a setting, so it is not
+-- known until user_config.lua has been merged, and §1 is far too early.
+--
+-- Written into config.drones rather than exposed as a lookup function, so that
+-- every existing reader -- loader.lua, job_node.lua, the broker's dashboard --
+-- keeps saying config.drones[key] and none of them has to know this happened.
+-- The label they get is simply correct, which is why nothing downstream needs a
+-- case-insensitive comparison.
+--
+-- config.droneMark and config.droneSuffix are published for the place that
+-- builds a label rather than reads one: the broker's DRILL_PAR broadcast, since
+-- the hw node holds no config and cannot derive either.
+--------------------------------------------------------------------------------
+-- Idempotent because it BUILDS from config.droneTiers rather than editing the
+-- strings it finds. The old version gsub'd the table in place, which was
+-- idempotent only by luck -- and stopped being reversible the moment 2.8 turned
+-- out to drop the voltage suffix as well as spell the marker differently. This
+-- is what lets the editor call it again with a different answer without
+-- config.lua keeping a pristine copy of anything around.
+function config.setGtVersion(version)
+  config.gtVersion = version
+  config.settings.gtVersion = version
+  config.droneMark   = moduleApi.mark(version)
+  config.droneSuffix = moduleApi.suffix(version)
+  config.drones = {}
+  for key, tier in pairs(config.droneTiers) do
+    config.drones[key] = moduleApi.droneLabel(tier.roman, tier.volt, version)
+  end
+  -- Label -> key, for reading a drone back OUT of a module's input bus. The
+  -- broker needs it at boot: a module that was mining when the broker went down
+  -- still has its drone in the bus, and the only thing identifying it is the
+  -- label the transposer reports.
+  --
+  -- Rebuilt here rather than beside config.drones so it can never disagree with
+  -- the spelling this pack uses -- a stale "MK-" key would simply fail to match
+  -- and the drone would go unrecognised, which is the quiet half of this bug.
+  config.droneKeyByLabel = {}
+  for key, name in pairs(config.drones) do
+    config.droneKeyByLabel[name] = key
+  end
+  return config.droneMark
+end
+
+config.setGtVersion(config.gtVersion)
+
+-- "Mk-IX (UHV)" -- the drone's tier and voltage, for panels that are naming a
+-- tier rather than resolving an item.
+--
+-- Built from the parts, not trimmed off the label. It used to be a gsub over
+-- config.drones[key], which is fine right up until the label stops carrying the
+-- voltage: on 2.8 that trim yields a bare "MK-IX" and every dashboard silently
+-- loses its voltage column. A display string and an item name are two different
+-- things, and only one of them has to match what the ME network says.
+function config.droneModel(key)
+  local tier = config.droneTiers[key]
+  if not tier then return "Drone-" .. tostring(key) end
+  return config.droneMark .. "-" .. tier.roman .. " (" .. tier.volt .. ")"
 end
 
 return config
