@@ -515,6 +515,58 @@ local function writeConfig()
 end
 
 -- ---------------------------------------------------------------------------
+-- Tier: read from the module controller. Nothing in GT guarantees WHERE, so
+-- every string the adapter hands back is scraped. Roman MK markers go
+-- longest-first so "MK-III" cannot match the "MK-I" prefix.
+-- ---------------------------------------------------------------------------
+local TIER_BY_NUM = { "MK-I", "MK-II", "MK-III" }
+
+local function tierFromText(text)
+  local up = text:upper()
+  -- The space elevator modules' getName() carries the tier as "t<n>", not as an
+  -- MK marker: the pumps are projectmodulepumpt1..t3 (space-pumping/config.lua),
+  -- and the miners follow the same scheme.
+  local t = up:match("PROJECTMODULEMINERT([123])")
+  if t then return TIER_BY_NUM[tonumber(t)] end
+  for _, roman in ipairs({ "III", "II", "I" }) do
+    if up:find("MK[%s%-_]?" .. roman .. "%f[^IV]") then return "MK-" .. roman end
+  end
+  local n = up:match("MK[%s%-_]?([123])") or up:match("TIER[%s:]+([123])")
+  if n then return TIER_BY_NUM[tonumber(n)] end
+  return nil
+end
+
+local function machineStrings(addr)
+  local proxy = component.proxy(addr)
+  local out = {}
+  local function collect(v)
+    if type(v) == "string" then
+      out[#out + 1] = v
+    elseif type(v) == "table" then
+      for _, inner in pairs(v) do collect(inner) end
+    end
+  end
+  -- getParameters is GTNH 2.9's introspection call and getParametersInfo is
+  -- 2.8's; a module has one or the other, and the pcall tolerates the missing one.
+  for _, call in ipairs({ "getName", "getSensorInformation",
+                          "getParameters", "getParametersInfo" }) do
+    local okCall, res = pcall(function() return proxy[call] and proxy[call]() end)
+    if okCall then collect(res) end
+  end
+  return out
+end
+
+-- The tier and the string it was read from, or nil and what getName() said.
+local function readTier(addr)
+  for _, s in ipairs(machineStrings(addr)) do
+    local tier = tierFromText(s)
+    if tier then return tier, s end
+  end
+  local okN, name = pcall(component.proxy(addr).getName)
+  return nil, tostring(okN and name or "?")
+end
+
+-- ---------------------------------------------------------------------------
 -- FIX MODE: re-detect modules already in the config.
 -- ---------------------------------------------------------------------------
 local mode, which = ...
@@ -535,9 +587,24 @@ if mode == "fix" then
     local mc = config.modules[i]
     if not mc then error("No module " .. tostring(i) .. " in the config.") end
     print("\n=== MODULE " .. i .. " (" .. tostring(mc.tier) .. ") ===")
+
+    -- The tier is read independently of the wiring, so a wiring failure does
+    -- not stop a wrongly recorded tier from being corrected.
+    local tier, said = readTier(mc.moduleAddr)
+    if tier then
+      print("  -> tier          = " .. tier .. "  (read from: \"" .. said:gsub("§.", "") .. "\")")
+      if tier ~= mc.tier then
+        mc.tier = tier
+        anyChange = true
+        print("  [CHANGED] tier")
+      end
+    else
+      print("  tier: could not read it from getName() = " .. said .. "; left as " .. tostring(mc.tier))
+    end
+
     local r, err = probeModule(mc, claimedBuses(i))
     if not r then
-      print("  FAILED, left unchanged: " .. err)
+      print("  FAILED, wiring left unchanged: " .. err)
     else
       if r.busNote then print("  bus: " .. r.busNote) end
       -- A bus that was not found leaves the old busAddr alone.
@@ -545,7 +612,7 @@ if mode == "fix" then
       local changed = mc.interfaceSide ~= r.interfaceSide or mc.inputBusSide ~= r.inputBusSide
                       or mc.busAddr ~= newBus
       mc.interfaceSide, mc.inputBusSide, mc.busAddr = r.interfaceSide, r.inputBusSide, newBus
-      print(changed and "  [CHANGED]" or "  (already correct)")
+      print(changed and "  [CHANGED] wiring" or "  wiring already correct")
       if changed then anyChange = true end
     end
   end
@@ -618,43 +685,6 @@ if not (#newMachines == 1 and #newInterfaces == 1 and #newTransposers == 1) then
   return
 end
 
--- ---------------------------------------------------------------------------
--- Tier: read from the module controller. Nothing in GT guarantees WHERE, so
--- every string the adapter hands back is scraped for an MK marker. Roman first,
--- longest-first so "MK-III" cannot match the "MK-I" prefix.
--- ---------------------------------------------------------------------------
-local TIER_BY_NUM = { "MK-I", "MK-II", "MK-III" }
-
-local function tierFromText(text)
-  local up = text:upper()
-  for _, roman in ipairs({ "III", "II", "I" }) do
-    if up:find("MK[%s%-_]?" .. roman .. "%f[^IV]") then return "MK-" .. roman end
-  end
-  local n = up:match("MK[%s%-_]?([123])") or up:match("TIER[%s:]+([123])")
-  if n then return TIER_BY_NUM[tonumber(n)] end
-  return nil
-end
-
-local function machineStrings(addr)
-  local proxy = component.proxy(addr)
-  local out = {}
-  local function collect(v)
-    if type(v) == "string" then
-      out[#out + 1] = v
-    elseif type(v) == "table" then
-      for _, inner in pairs(v) do collect(inner) end
-    end
-  end
-  -- getParameters is GTNH 2.9's introspection call and getParametersInfo is
-  -- 2.8's; a module has one or the other, and the pcall tolerates the missing one.
-  for _, call in ipairs({ "getName", "getSensorInformation",
-                          "getParameters", "getParametersInfo" }) do
-    local okCall, res = pcall(function() return proxy[call] and proxy[call]() end)
-    if okCall then collect(res) end
-  end
-  return out
-end
-
 -- Which parameter API this controller speaks: the same check module_api.lua
 -- makes at boot, reported so it is visible whether distanceParam matters.
 local function dialectOf(addr)
@@ -669,11 +699,7 @@ end
 local newIndex = existingCount + 1
 local template = config.modules[existingCount]
 
-local tier, tierEvidence
-for _, s in ipairs(machineStrings(newMachines[1])) do
-  tier = tierFromText(s)
-  if tier then tierEvidence = s break end
-end
+local tier, tierEvidence = readTier(newMachines[1])
 local dialect = dialectOf(newMachines[1])
 
 print("\n=== NEW MODULE " .. newIndex .. " ===")
@@ -686,8 +712,11 @@ if tier then
         tierEvidence:gsub("§.", "") .. "\")")
 else
   tier = template and template.tier or "MK-I"
-  print("  tier           = " .. tier .. "  (WARNING: the module did not report one; " ..
-        "using " .. (template and ("M" .. existingCount .. "'s") or "the default") ..
+  -- Show what the module did say, so a name this script does not know is
+  -- readable from the screen rather than a silent default.
+  print("  tier           = " .. tier .. "  (WARNING: could not read the tier from getName() = " ..
+        tierEvidence .. "; using " ..
+        (template and ("M" .. existingCount .. "'s") or "the default") ..
         " -- correct it in the config if wrong)")
 end
 
