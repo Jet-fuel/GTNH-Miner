@@ -661,6 +661,15 @@ end
 local function edToggle(item, asteroid)
   edTouch()
   if ed.enabled[item] then
+    -- In detail mode, toggling an item that is mapped to a DIFFERENT asteroid
+    -- should remap it to this asteroid instead of stopping tracking.
+    if asteroid and ed.targets[item] and ed.targets[item].asteroid ~= asteroid then
+      local old = ed.targets[item].asteroid
+      ed.targets[item] = { asteroid = asteroid, priority = nextPriority(asteroid) }
+      ed.added[item]   = true
+      edSay("remapped " .. item .. " (" .. old .. " -> " .. asteroid .. ")", 0x00FF00)
+      return
+    end
     ed.enabled[item] = nil
     edSay("stopped tracking " .. item)
     return
@@ -669,12 +678,18 @@ local function edToggle(item, asteroid)
   ed.threshold[item] = ed.threshold[item] or DEFAULT_TARGET
   -- Turning something on is the moment the mapping has to exist, and here the
   -- asteroid is known, so write it rather than leaving a condition that can
-  -- never dispatch.
-  if asteroid and not ed.targets[item] then
+  -- never dispatch. Also, if it was already mapped to a different asteroid, remap it.
+  if asteroid and (not ed.targets[item] or ed.targets[item].asteroid ~= asteroid) then
+    local old = ed.targets[item] and ed.targets[item].asteroid
     ed.targets[item] = { asteroid = asteroid, priority = nextPriority(asteroid) }
-    ed.added[item] = true
-    edSay("tracking " .. item .. " at " .. formatQty(ed.threshold[item]) ..
-          "  (mapped to " .. asteroid .. ")", 0x00FF00)
+    ed.added[item]   = true
+    if old then
+      edSay("tracking " .. item .. " at " .. formatQty(ed.threshold[item]) ..
+            "  (remapped " .. old .. " -> " .. asteroid .. ")", 0x00FF00)
+    else
+      edSay("tracking " .. item .. " at " .. formatQty(ed.threshold[item]) ..
+            "  (mapped to " .. asteroid .. ")", 0x00FF00)
+    end
   elseif not ed.targets[item] then
     edSay("tracking " .. item .. " -- but it has no asteroid, so it cannot mine", 0xFF4444)
   else
@@ -691,7 +706,18 @@ local function edCycleTarget(item)
   end
   ed.threshold[item] = nxt
   ed.enabled[item]   = true
-  edSay(item .. " target " .. formatQty(nxt), 0x00FF00)
+  if ed.mode == "detail" and ed.asteroid and (not ed.targets[item] or ed.targets[item].asteroid ~= ed.asteroid) then
+    local old = ed.targets[item] and ed.targets[item].asteroid
+    ed.targets[item] = { asteroid = ed.asteroid, priority = nextPriority(ed.asteroid) }
+    ed.added[item]   = true
+    if old then
+      edSay(item .. " target " .. formatQty(nxt) .. "  (remapped " .. old .. " -> " .. ed.asteroid .. ")", 0x00FF00)
+    else
+      edSay(item .. " target " .. formatQty(nxt) .. "  (mapped to " .. ed.asteroid .. ")", 0x00FF00)
+    end
+  else
+    edSay(item .. " target " .. formatQty(nxt), 0x00FF00)
+  end
 end
 
 -- Incremental text entry. Never blocks: each keystroke is just another event.
@@ -715,10 +741,11 @@ local function edAddDownstream()
   if not asteroid then return end
   edPrompt("item label yielded by " .. asteroid .. " (exact ME name):", function(name)
     if not name or name == "" then edSay("cancelled") return end
-    if ed.targets[name] then
-      edSay(name .. " is already mapped to " .. ed.targets[name].asteroid, 0xFFAA00)
+    if ed.targets[name] and ed.targets[name].asteroid == asteroid then
+      edSay(name .. " is already mapped to " .. asteroid, 0xFFAA00)
       return
     end
+    local oldAst = ed.targets[name] and ed.targets[name].asteroid
     ed.targets[name] = { asteroid = asteroid, priority = nextPriority(asteroid) }
     ed.added[name]   = true
     edPrompt("amount to maintain for " .. name .. " (5m, 500k, 250000):", function(q)
@@ -728,7 +755,11 @@ local function edAddDownstream()
         edSay("bad amount, defaulted " .. name .. " to " .. formatQty(DEFAULT_TARGET), 0xFFAA00)
       else
         ed.threshold[name] = n
-        edSay("added " .. name .. " -> " .. asteroid .. " at " .. formatQty(n), 0x00FF00)
+        if oldAst then
+          edSay("remapped " .. name .. " from " .. oldAst .. " -> " .. asteroid .. " at " .. formatQty(n), 0x00FF00)
+        else
+          edSay("added " .. name .. " -> " .. asteroid .. " at " .. formatQty(n), 0x00FF00)
+        end
       end
       ed.enabled[name] = true
       edRebuild()
@@ -774,7 +805,18 @@ local function edTypeTarget(item)
       edTouch()
       ed.threshold[item] = n
       ed.enabled[item]   = true
-      edSay(item .. " -> " .. formatQty(n), 0x00FF00)
+      if ed.mode == "detail" and ed.asteroid and (not ed.targets[item] or ed.targets[item].asteroid ~= ed.asteroid) then
+        local old = ed.targets[item] and ed.targets[item].asteroid
+        ed.targets[item] = { asteroid = ed.asteroid, priority = nextPriority(ed.asteroid) }
+        ed.added[item]   = true
+        if old then
+          edSay(item .. " -> " .. formatQty(n) .. "  (remapped " .. old .. " -> " .. ed.asteroid .. ")", 0x00FF00)
+        else
+          edSay(item .. " -> " .. formatQty(n) .. "  (mapped to " .. ed.asteroid .. ")", 0x00FF00)
+        end
+      else
+        edSay(item .. " -> " .. formatQty(n), 0x00FF00)
+      end
       edRebuild()
     end)
 end
@@ -1510,8 +1552,13 @@ local function edDraw()
           have >= tgt and 0x00FF00 or (have > 0 and 0xFFAA00 or 0x555555) }
 
         if ed.mode == "detail" then
-          cells[#cells+1] = { X_C, tostring(row.source or "hand-typed"):sub(1, W - X_C),
-                              0x666666 }
+          local t = ed.targets[item]
+          if t and t.asteroid and t.asteroid ~= ed.asteroid then
+            cells[#cells+1] = { X_C, ("-> " .. t.asteroid):sub(1, W - X_C), 0xFFAA00 }
+          else
+            cells[#cells+1] = { X_C, tostring(row.source or "hand-typed"):sub(1, W - X_C),
+                                0x666666 }
+          end
         else
           local t = ed.targets[item]
           if t then
@@ -1905,6 +1952,9 @@ editor._internal = {
   bindingFor  = edBindingFor,
   legend      = edLegend,
   action      = edAction,
+  toggle      = edToggle,
+  cycleTarget = edCycleTarget,
+  typeTarget  = edTypeTarget,
 }
 
 return editor
