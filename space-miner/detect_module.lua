@@ -7,6 +7,8 @@
 --        - gt_machine  adapter  (controls the Mining Module)
 --        - me_interface adapter (the module's ME Interface)
 --        - transposer           (moves items interface buffer -> input bus)
+--      and, only for stockingMode = filter, the stocking bus: an adapter
+--      touching it, or an adapter holding an MFU bound to it (me_inputbus).
 --   2. Run this script. It finds the components NOT already in the config.
 --   3. It shows the detected module + the sides it copied from the last module,
 --      and asks you to confirm before writing anything.
@@ -33,6 +35,10 @@ local TYPE_MACHINE    = "gt_machine"
 local TYPE_INTERFACE  = "me_interface"
 local TYPE_TRANSPOSER = "transposer"
 local TYPE_DATABASE   = "database"
+-- Optional, for stockingMode = filter: the stocking bus, reached through an
+-- adapter touching it or an adapter holding an MFU bound to it. Both show up as
+-- this same component type, so nothing here needs to know which was used.
+local TYPE_BUS        = "me_inputbus"
 
 print("=== DETECT MODULE ===")
 
@@ -129,6 +135,7 @@ for _, mod in ipairs(config.modules) do
   if mod.moduleAddr     then known[mod.moduleAddr]     = true end
   if mod.ifaceAddr      then known[mod.ifaceAddr]      = true end
   if mod.transposerAddr then known[mod.transposerAddr] = true end
+  if mod.busAddr        then known[mod.busAddr]        = true end
 end
 -- Also treat the shared database as known so it's never mistaken for new.
 if config.dbAddr then known[config.dbAddr] = true end
@@ -159,7 +166,7 @@ end
 -- full list does not. We also print every type we see, so if nothing matches
 -- you can read the real names instead of getting a silent empty result.
 -- ---------------------------------------------------------------------------
-local newMachines, newInterfaces, newTransposers = {}, {}, {}
+local newMachines, newInterfaces, newTransposers, newBuses = {}, {}, {}, {}
 local seenTypes = {}
 
 for addr, ctype in component.list() do
@@ -168,6 +175,7 @@ for addr, ctype in component.list() do
     if     ctype:find(TYPE_MACHINE,    1, true) then newMachines[#newMachines + 1]       = addr
     elseif ctype:find(TYPE_INTERFACE,  1, true) then newInterfaces[#newInterfaces + 1]   = addr
     elseif ctype:find(TYPE_TRANSPOSER, 1, true) then newTransposers[#newTransposers + 1] = addr
+    elseif ctype:find(TYPE_BUS,        1, true) then newBuses[#newBuses + 1]             = addr
     end
   end
 end
@@ -175,9 +183,21 @@ end
 print("\nComponent types present on this computer:")
 for t, n in pairs(seenTypes) do print(string.format("  %-22s x%d", t, n)) end
 
-print(string.format("\nNew (unconfigured): %d %s, %d %s, %d %s",
+print(string.format("\nNew (unconfigured): %d %s, %d %s, %d %s, %d %s",
   #newMachines, TYPE_MACHINE, #newInterfaces, TYPE_INTERFACE,
-  #newTransposers, TYPE_TRANSPOSER))
+  #newTransposers, TYPE_TRANSPOSER, #newBuses, TYPE_BUS))
+
+-- The bus is optional, so it never stops the run. Exactly one new one is taken
+-- as this module's. More than one cannot be told apart from here -- that needs
+-- the item probe in detect_sides, which can see which bus fills this module's
+-- transposer face.
+local newBusAddr
+if #newBuses == 1 then
+  newBusAddr = newBuses[1]
+elseif #newBuses > 1 then
+  print("  " .. #newBuses .. " new " .. TYPE_BUS .. " components; leaving busAddr unset.")
+  print("  Run detect_sides afterwards to probe for this module's bus.")
+end
 
 -- ---------------------------------------------------------------------------
 -- Validate the "exactly one new of each" assumption
@@ -329,6 +349,7 @@ print("  moduleAddr     = " .. newMachines[1])
 print("  module API     = " .. (dialect or "? — neither setParameter nor setParameters"))
 print("  ifaceAddr      = " .. newInterfaces[1])
 print("  transposerAddr = " .. newTransposers[1])
+print("  busAddr        = " .. (newBusAddr or "(none -- only needed for stockingMode = filter)"))
 if detectedTier then
   print("  tier           = " .. detectedTier .. "  (read from the module: \"" ..
         tierEvidence:gsub("§.", "") .. "\")")
@@ -350,6 +371,7 @@ local proposed = {
   interfaceSide  = askSide("Interface (ME Interface buffer)", defIface),
   inputBusSide   = askSide("Input Bus", defBus),
   distanceParam  = template and template.distanceParam or 0,
+  busAddr        = newBusAddr,
 }
 
 print("\n=== PROPOSED MODULE " .. newIndex .. " ===")
@@ -359,6 +381,7 @@ print("  ifaceAddr      = " .. proposed.ifaceAddr)
 print("  transposerAddr = " .. proposed.transposerAddr)
 print("  interfaceSide  = " .. proposed.interfaceSide)
 print("  inputBusSide   = " .. proposed.inputBusSide)
+print("  busAddr        = " .. (proposed.busAddr or "(none)"))
 print("  distanceParam  = " .. proposed.distanceParam ..
       (dialect and dialect:find("2%.9") and "   (ignored on GTNH 2.9)" or ""))
 io.write("\nWrite this as module " .. newIndex .. "? [y/N]: ")
@@ -393,6 +416,10 @@ for i, mod in ipairs(config.modules) do
   -- so re-running this script never silently drops a module's pin.
   if mod.pinnedAsteroid then
     f:write("      pinnedAsteroid = \"" .. mod.pinnedAsteroid .. "\",\n")
+  end
+  -- busAddr is hand-set too (stockingMode = filter). Same rule as the pin.
+  if mod.busAddr then
+    f:write("      busAddr        = \"" .. mod.busAddr .. "\",\n")
   end
   f:write("    },\n")
 end

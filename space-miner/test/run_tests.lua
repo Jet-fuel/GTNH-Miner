@@ -1054,6 +1054,65 @@ loader.topUp(m, { { label = TIP, target = 64, cfgSlot = 2, dbSlot = 2 } }, "dbad
 ck("stopped module gets no items", m.calls.transferItem, 0)
 
 -- =============================================================================
+section("loader bus filters -- stockingMode = filter")
+-- =============================================================================
+-- A stocking bus that records its filters, and an interface that answers the
+-- label lookup the way OpenComputers does: a list of detail records.
+local function withBus(mod, known)
+  mod.calls.setConfiguration, mod.calls.getItemsInNetwork = 0, 0
+  mod.filters = {}
+  mod.bus = { setConfiguration = function(slot, detail)
+    mod.calls.setConfiguration = mod.calls.setConfiguration + 1
+    mod.filters[slot] = detail
+  end }
+  mod.iface.getItemsInNetwork = function(filter)
+    mod.calls.getItemsInNetwork = mod.calls.getItemsInNetwork + 1
+    if known[filter.label] then return { { label = filter.label, name = "gt.metaitem" } } end
+    return {}
+  end
+  return mod
+end
+local BOTH = {
+  { label = TIP, busSlot = 1 },
+  { label = ROD, busSlot = 2 },
+}
+
+-- Both consumables get a filter, each in its own slot -- the bug the bench had
+-- was setting only the first.
+m = withBus(fakeMod({ stack("Drone", 1) }, {}), { [TIP] = true, [ROD] = true })
+local okF = loader.setBusFilters(m, BOTH)
+ck("filters: set ok",            okF, true)
+ck("filters: tip in slot 1",     m.filters[1] and m.filters[1].label, TIP)
+ck("filters: rod in slot 2",     m.filters[2] and m.filters[2].label, ROD)
+ck("filters: nothing moved",     m.calls.transferItem, 0)
+ck("filters: interface untouched", m.calls.setInterfaceConfiguration, 0)
+
+-- The detail lookup is cached: a pinned module re-asserts its filters every
+-- interval, and that must not cost a network query each time.
+loader.setBusFilters(m, BOTH)
+ck("filters: lookups cached",    m.calls.getItemsInNetwork, 2)
+
+-- A label the network does not know refuses, with a reason, and sets nothing.
+m = withBus(fakeMod({ stack("Drone", 1) }, {}), { [TIP] = true })
+local okR, why = loader.setBusFilters(m, { { label = ROD, busSlot = 2 } })
+ck("filters: unknown label refused", okR, false)
+ck("filters: reason given",          type(why), "string")
+ck("filters: nothing set",           m.filters[2], nil)
+
+-- Clearing the interface clears the bus filters too, so no cleanup path can
+-- leave ME feeding a stopped module's bus.
+m = withBus(fakeMod({ stack("Drone", 1) }, {}), { [TIP] = true, [ROD] = true })
+loader.setBusFilters(m, BOTH)
+loader.clearInterfaceSlots(m)
+ck("clear: tip filter gone",     m.filters[1], nil)
+ck("clear: rod filter gone",     m.filters[2], nil)
+
+-- A module without a bus clears exactly as before.
+m = fakeMod({ stack("Drone", 1) }, {})
+local okC = pcall(loader.clearInterfaceSlots, m)
+ck("clear: no bus is fine",      okC, true)
+
+-- =============================================================================
 section("logger.lua -- formatting happens after the level check")
 -- =============================================================================
 -- Call sites used to read logger:info(string.format(...)), so the string was

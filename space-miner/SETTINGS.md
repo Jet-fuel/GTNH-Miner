@@ -241,6 +241,45 @@ This value is pushed to the hw node inside DRILL_PAR — it does not read a
 config file, and it does not listen on the port that carries the other node
 settings.
 
+### `stockingMode`
+
+How a running module's drill tips and rods get into its input bus. Default
+**transfer**.
+
+- **transfer** — the original path. The ME Interface is asked to stock each
+  consumable, and the transposer moves it from the interface buffer into the
+  bus.
+- **filter** — the stocking bus's filter slots are set to the tip and the rod
+  (filter slot 1 and 2), and ME feeds them into the bus directly. Nothing
+  passes through the interface buffer and the transposer does not move them.
+  The **drone still moves by transfer** in both modes.
+
+Filter mode needs the bus reachable from the broker: either an adapter touching
+the stocking bus, or an adapter holding an MFU bound to it. Both appear as the
+same `me_inputbus` component. Its address goes in the module's config entry as
+`busAddr` (`job_node_config.lua`), and the detection scripts fill it in:
+
+- `detect_module` takes it when exactly one new bus is attached alongside the
+  module's other new components.
+- `detect_sides` answers **y** to "Also find each module's stocking bus" and
+  probes: it sets the probe item as a filter on each unclaimed bus and watches
+  which one shows up on that module's transposer face. If none does, it lists
+  the buses and asks. A regular stocking bus only pulls while its machine runs,
+  so run it with the module on, or pick by hand.
+
+A module without `busAddr` keeps transferring and logs a warning once, so one
+unconfigured module does not hold the others back.
+
+The filters are set on the first restock pass after a module starts and stay set
+for the whole run, so the module never has to stop for tips or rods. They are
+cleared together with the interface slots whenever the module stops — a filter
+left set would keep ME feeding a bus nobody is using, which is the same leak the
+interface clearing exists to prevent.
+
+What this version does **not** change: the initial load still moves tips and
+rods by transfer. A regular stocking bus pulls when the machine asks for items, so the
+filter path relies on the machine running; it fills instantly while it is.
+
 ### `config.drillPar` — per-material restock floors
 
 Not a scalar setting; it is a table, edited on the editor's **drills** page.

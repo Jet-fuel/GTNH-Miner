@@ -118,6 +118,15 @@ S.list = {
     label = "Auto-craft drill consumables",
     help  = "off = never ask the hw node to craft tips or rods; stock them yourself" },
 
+  -- transfer = move tips and rods through the ME interface, as always.
+  -- filter   = set the stocking bus filters for tips and rods, so ME feeds them
+  --            straight into the bus. The drone still moves by transfer. A module
+  --            needs busAddr in its config for this; without it, it falls back.
+  { key = "stockingMode", group = "restock", type = "choice", default = "transfer",
+    choices = { "transfer", "filter" },
+    label = "Tips and rods by",
+    help  = "transfer = move them through the interface (old way); filter = set the stocking bus filters" },
+
   -- NOT scope = "node". The hw node is the only machine that cares about these
   -- two, and it does not listen on the command port that carries NODE_SETTINGS
   -- -- it is deliberately kept off it so the dust watchlist never reaches its

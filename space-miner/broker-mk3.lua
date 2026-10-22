@@ -99,6 +99,10 @@ for i, mc in ipairs(nodeConf.modules) do
     adapter         = getProxy(mc.moduleAddr, lbl .. " moduleAddr"),
     iface           = getProxy(mc.ifaceAddr, lbl .. " ifaceAddr"),
     transposer      = getProxy(mc.transposerAddr, lbl .. " transposerAddr"),
+    -- Optional: the stocking bus's own component (an adapter touching it), used
+    -- only when stockingMode = "filter". Absent means this module transfers.
+    bus             = (mc.busAddr and mc.busAddr ~= "")
+                      and getProxy(mc.busAddr, lbl .. " busAddr") or nil,
     status          = "IDLE", -- IDLE | LOADING | RUNNING | DONE | ERROR
     job             = nil,
     doneTime        = nil,
@@ -564,7 +568,8 @@ end
 -- Costs the same as the old three-slot version in the shipped configuration:
 -- see the note on loader.clearInterfaceSlots.
 local function clearInterfaceSlots(mod)
-  loader.clearInterfaceSlots(mod)
+  loader.clearInterfaceSlots(mod)   -- also clears the bus filters, if any
+  mod.filtersSet = false            -- next run logs its filters again
 end
 
 local function getOptimalDistance(moduleTier, asteroid, droneKey)
@@ -730,9 +735,36 @@ local function restockRunning(mod)
   local _, slotTip, slotRod = loader.dbSlotsFor(mod.index)
 
   local wanted = {
-    { label = drill.tip, target = TIPS_PER, cfgSlot = 2, dbSlot = slotTip },
-    { label = drill.rod, target = RODS_PER, cfgSlot = 3, dbSlot = slotRod },
+    { label = drill.tip, target = TIPS_PER, cfgSlot = 2, dbSlot = slotTip, busSlot = 1 },
+    { label = drill.rod, target = RODS_PER, cfgSlot = 3, dbSlot = slotRod, busSlot = 2 },
   }
+
+  -- FILTER MODE: set the bus filters and let ME feed the bus. One call per
+  -- consumable, nothing to wait for and nothing to move, so the pass is settled
+  -- as soon as the filters are in. They stay set for the run (a pinned module
+  -- re-asserts them every interval, which costs two calls) and are cleared with
+  -- the interface slots when the module stops.
+  --
+  -- A module without busAddr falls back to transfer, warned once, so one
+  -- unconfigured module cannot stop the others from using the setting.
+  if config.stockingMode == "filter" then
+    if mod.bus then
+      local okF, ferr = loader.setBusFilters(mod, wanted)
+      if okF then
+        if not mod.filtersSet then
+          mod.filtersSet = true
+          logger:info("[RESTOCK] M%d bus filters set: %s, %s", mod.index, drill.tip, drill.rod)
+        end
+        return true
+      end
+      logger:warn("[RESTOCK] M%d could not set bus filters (%s), transferring instead",
+        mod.index, tostring(ferr))
+    elseif not mod.warnedNoBus then
+      mod.warnedNoBus = true
+      logger:warn("[RESTOCK] M%d stockingMode is filter but busAddr is not configured; transferring",
+        mod.index)
+    end
+  end
 
   local results, totals, moved = loader.topUp(mod, wanted, dbAddr)
 

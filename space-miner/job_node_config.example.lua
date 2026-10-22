@@ -50,6 +50,7 @@ return {
     --     moduleAddr     = "<gt_machine adapter address>",
     --     ifaceAddr      = "<me_interface adapter address>",
     --     transposerAddr = "<transposer address>",
+    --     busAddr        = "<me_inputbus adapter address>", -- optional; only for stockingMode = filter
     --     interfaceSide  = 3,   -- 0=down 1=up 2=north 3=south 4=west 5=east
     --     inputBusSide   = 2,
     --     distanceParam  = 0,

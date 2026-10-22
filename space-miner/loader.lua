@@ -140,6 +140,46 @@ local function clearInputBus(mod)
   end
 end
 
+-- ---------------------------------------------------------------------------
+-- STOCKING BUS FILTERS  (stockingMode = "filter")
+--
+-- The stocking bus has filter slots of its own, separate from its inventory.
+-- Setting one tells ME to feed that item straight into the bus, so tips and
+-- rods no longer pass through the interface buffer and the transposer. The
+-- drone is not handled here: it still moves by transfer.
+--
+-- A filter needs the item's full detail record, not just its label. The ME
+-- Interface returns that record for a label; it is cached on the module because
+-- the record for a label never changes within a run.
+-- ---------------------------------------------------------------------------
+local BUS_FILTER_SLOTS = 2   -- tip in filter slot 1, rod in filter slot 2
+
+local function itemDetail(mod, label)
+  mod.details = mod.details or {}
+  local cached = mod.details[label]
+  if cached then return cached end
+  local ok, list = pcall(mod.iface.getItemsInNetwork, { label = label })
+  if not ok then return nil, "getItemsInNetwork failed: " .. tostring(list) end
+  if not list or not list[1] then return nil, "no item labelled '" .. label .. "' in the network" end
+  mod.details[label] = list[1]
+  return list[1]
+end
+
+-- One filter per consumable. Each wanted entry needs `label` and `busSlot`.
+-- Returns true, or false and the first reason it could not.
+local function setBusFilters(mod, wanted)
+  for _, w in ipairs(wanted) do
+    local detail, err = itemDetail(mod, w.label)
+    if not detail then return false, err end
+    mod.bus.setConfiguration(w.busSlot, detail)
+  end
+  return true
+end
+
+local function clearBusFilters(mod)
+  for slot = 1, BUS_FILTER_SLOTS do mod.bus.setConfiguration(slot) end
+end
+
 -- Clear the interface configuration slots this module may currently be holding.
 --
 -- CLEARS WHAT WAS ACTUALLY USED, not a fixed count, because every slot is a
@@ -162,6 +202,11 @@ local function clearInterfaceSlots(mod)
     mod.iface.setInterfaceConfiguration(slot)
   end
   mod.cfgHigh = 0   -- nothing configured now
+
+  -- A bus filter left set is the same leak as a configured interface slot: ME
+  -- keeps feeding a bus nobody is using. Cleared whatever the stocking mode, so
+  -- switching the setting mid-run cannot strand one.
+  if mod.bus then clearBusFilters(mod) end
 end
 
 -- ---------------------------------------------------------------------------
@@ -758,5 +803,10 @@ loader.snapshotSide = snapshotSide
 -- leave slots 4-8 configured and the ME stocking into a bus nobody was loading.
 loader.clearInterfaceSlots = clearInterfaceSlots
 loader.MAX_CFG_SLOTS       = MAX_CFG_SLOTS
+
+-- stockingMode = "filter": the broker's restock path sets these instead of
+-- calling topUp. Clearing goes through clearInterfaceSlots like everything else.
+loader.setBusFilters       = setBusFilters
+loader.clearBusFilters     = clearBusFilters
 
 return loader

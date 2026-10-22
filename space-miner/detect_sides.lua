@@ -21,6 +21,12 @@
 -- confirms it landed, and moves it back. That exercises the exact transferItem()
 -- call that loader.lua step 5 performs, so a pass here means the loader will work.
 --
+-- OPTIONALLY, for stockingMode = filter, it also finds each module's stocking
+-- bus component (busAddr): it sets the probe item as a filter on each unclaimed
+-- me_inputbus and watches which one shows up on this module's bus face. An
+-- adapter touching the bus and an adapter holding an MFU bound to it look the
+-- same to this probe. If nothing shows, it lists the buses and asks.
+--
 -- USAGE:  detect_sides            (prompts for which module)
 --         detect_sides 3          (fixes module 3)
 --         detect_sides all        (walks every module in turn)
@@ -105,6 +111,44 @@ local function ask(prompt, default)
 end
 
 -- ---------------------------------------------------------------------------
+-- Stocking bus helpers (stockingMode = filter)
+--
+-- The bus is reached through an adapter touching it or an adapter holding an
+-- MFU bound to it. OpenComputers presents both as the same me_inputbus
+-- component, so the probe below does not care which one was built.
+-- ---------------------------------------------------------------------------
+
+-- Bus filter slot the probe borrows. The broker only sets filters while a
+-- module runs and clears them when it stops, so this is free during detection.
+local PROBE_BUS_SLOT    = 1
+local BUS_PROBE_TIMEOUT = 5
+
+-- How many of `label` sit on one transposer face.
+local function sideTotal(transposer, side, label)
+  local ok, size = pcall(transposer.getInventorySize, side)
+  if not ok or not size then return 0 end
+  local total = 0
+  for s = 1, size do
+    local ok2, st = pcall(transposer.getStackInSlot, side, s)
+    if ok2 and st and st.label == label then total = total + (st.size or 0) end
+  end
+  return total
+end
+
+-- Move every stack of `label` from one face to another. Used to hand back
+-- whatever a bus pulled during its probe.
+local function moveAll(transposer, from, to, label)
+  local ok, size = pcall(transposer.getInventorySize, from)
+  if not ok or not size then return end
+  for s = 1, size do
+    local ok2, st = pcall(transposer.getStackInSlot, from, s)
+    if ok2 and st and st.label == label then
+      pcall(transposer.transferItem, from, to, st.size, s)
+    end
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- Load configs
 -- ---------------------------------------------------------------------------
 
@@ -151,6 +195,100 @@ local dbAddr = component.get(nodeConf.dbAddr)
 -- Probe fingerprints go in the first slot past every module's 3-slot partition,
 -- so we can never clobber a real load's drone/tip/rod.
 local PROBE_DB_SLOT = #nodeConf.modules * 3 + 1
+
+-- ---------------------------------------------------------------------------
+-- Find one module's stocking bus
+--
+-- THE PROBE: set the probe item as a filter on each candidate bus in turn and
+-- watch THIS module's bus face on its transposer. The bus whose face shows the
+-- item is this module's bus, by definition -- the same active-signal idea as
+-- the interface probe, with no reliance on addresses or block names.
+-- ---------------------------------------------------------------------------
+
+-- Set in main: whether to look for buses at all. Off by default, since only
+-- stockingMode = filter uses them.
+local wantBus = false
+
+-- Every me_inputbus reachable from here that no OTHER module already claims.
+local function unclaimedBuses(index)
+  local claimed = {}
+  for j, m in ipairs(nodeConf.modules) do
+    if j ~= index and m.busAddr then
+      local full = component.get(m.busAddr)
+      if full then claimed[full] = true end
+    end
+  end
+  local list = {}
+  for addr in component.list("me_inputbus") do
+    if not claimed[addr] then list[#list + 1] = addr end
+  end
+  table.sort(list)
+  return list
+end
+
+-- When the probe cannot decide: list the candidates and let the operator pick.
+-- The default keeps whatever the config already says, or skips.
+local function pickBusByHand(cands, current)
+  local def = 0
+  for i, a in ipairs(cands) do
+    local mark = ""
+    if current and a:sub(1, #current) == current then def, mark = i, "  (current)" end
+    print(string.format("    [%d] %s%s", i, a, mark))
+  end
+  local pick = tonumber(ask("  Which is this module's bus? [" .. def .. " = " ..
+    (def == 0 and "skip" or "keep current") .. "]: ", tostring(def)))
+  return pick and cands[pick] or nil
+end
+
+local function detectBus(index, mc, transposer, iface, ifaceSide, busSide, probeLabel)
+  print("\n  Looking for this module's stocking bus (me_inputbus)...")
+  local cands = unclaimedBuses(index)
+  if #cands == 0 then
+    print("  None reachable. Filter mode needs an adapter touching the stocking bus,")
+    print("  or an adapter holding an MFU bound to it, on this computer's network.")
+    return nil
+  end
+
+  -- A filter needs the item's full record, which the interface returns for a label.
+  local okL, list = pcall(iface.getItemsInNetwork, { label = probeLabel })
+  local detail = okL and type(list) == "table" and list[1] or nil
+  if not detail then
+    print("  Could not look up '" .. probeLabel .. "' through the interface" ..
+          (okL and "" or (": " .. tostring(list))) .. ", so the buses cannot be probed.")
+    return pickBusByHand(cands, mc.busAddr)
+  end
+
+  -- If the item is already on the bus face (the probe item is the drone sitting
+  -- in slot 1, say), its arrival cannot be told from what was there before.
+  if sideTotal(transposer, busSide, probeLabel) > 0 then
+    print("  '" .. probeLabel .. "' is already in this bus, so the probe cannot see it")
+    print("  arrive. Re-run with a probe item that is not in the bus, or pick:")
+    return pickBusByHand(cands, mc.busAddr)
+  end
+
+  for _, addr in ipairs(cands) do
+    local bus = component.proxy(addr)
+    io.write("    " .. addr:sub(1, 8) .. "...  ")
+    local okSet = pcall(bus.setConfiguration, PROBE_BUS_SLOT, detail)
+    local hit = okSet and pollUntil(function()
+      return sideTotal(transposer, busSide, probeLabel) > 0
+    end, BUS_PROBE_TIMEOUT)
+    -- Clear first, then hand back whatever the bus pulled.
+    pcall(bus.setConfiguration, PROBE_BUS_SLOT)
+    moveAll(transposer, busSide, ifaceSide, probeLabel)
+    if hit then
+      print("this module's bus")
+      return addr
+    end
+    print(okSet and "not this one" or "refused the filter")
+  end
+
+  print("  No bus showed the item on this module's face within " ..
+        BUS_PROBE_TIMEOUT .. "s each.")
+  print("  A regular stocking bus only pulls while its machine runs -- start the")
+  print("  module and re-run, or pick by hand:")
+  return pickBusByHand(cands, mc.busAddr)
+end
 
 -- ---------------------------------------------------------------------------
 -- Detect one module
@@ -296,7 +434,13 @@ local function detectModule(index, probeLabel)
 
   cleanup()
 
-  return { interfaceSide = ifaceSide, inputBusSide = busSide }
+  -- --- Pass 5 (optional): which stocking bus is this module's? -------------
+  local busAddr
+  if wantBus then
+    busAddr = detectBus(index, mc, transposer, iface, ifaceSide, busSide, probeLabel)
+  end
+
+  return { interfaceSide = ifaceSide, inputBusSide = busSide, busAddr = busAddr }
 end
 
 -- ---------------------------------------------------------------------------
@@ -323,6 +467,10 @@ local function writeConfig()
     -- so re-running this script never silently drops a module's pin.
     if mod.pinnedAsteroid then
       f:write("      pinnedAsteroid = \"" .. mod.pinnedAsteroid .. "\",\n")
+    end
+    -- busAddr is hand-set too (stockingMode = filter). Same rule as the pin.
+    if mod.busAddr then
+      f:write("      busAddr        = \"" .. mod.busAddr .. "\",\n")
     end
     f:write("    },\n")
   end
@@ -365,6 +513,9 @@ print("It is borrowed for a few seconds and put straight back.")
 local probeLabel = ask("Probe item label [" .. tostring(defaultProbe) .. "]: ", defaultProbe)
 if not probeLabel then error("No probe item given and no default found in config.lua.") end
 
+wantBus = ask("Also find each module's stocking bus (only for stockingMode = filter)? [y/N]: ",
+              "n"):lower():sub(1, 1) == "y"
+
 local results = {}
 for _, i in ipairs(targets) do
   results[i] = detectModule(i, probeLabel)
@@ -379,11 +530,19 @@ for _, i in ipairs(targets) do
     print("  M" .. i .. ": FAILED (left unchanged)")
   else
     local old = nodeConf.modules[i]
+    -- A bus that was not found leaves the old busAddr alone, so it never counts
+    -- as a change.
+    local busChanged = r.busAddr ~= nil and r.busAddr ~= old.busAddr
     local changed = (old.interfaceSide ~= r.interfaceSide) or (old.inputBusSide ~= r.inputBusSide)
+                    or busChanged
     print(string.format("  M%d: interfaceSide %s -> %d, inputBusSide %s -> %d%s",
           i, tostring(old.interfaceSide), r.interfaceSide,
           tostring(old.inputBusSide), r.inputBusSide,
           changed and "  [CHANGED]" or "  (already correct)"))
+    if wantBus then
+      print(string.format("       busAddr %s -> %s", tostring(old.busAddr),
+            r.busAddr and r.busAddr or "(not found, unchanged)"))
+    end
     if changed then anyChange = true end
   end
 end
@@ -405,6 +564,7 @@ for _, i in ipairs(targets) do
   if results[i] then
     nodeConf.modules[i].interfaceSide = results[i].interfaceSide
     nodeConf.modules[i].inputBusSide  = results[i].inputBusSide
+    if results[i].busAddr then nodeConf.modules[i].busAddr = results[i].busAddr end
   end
 end
 writeConfig()
